@@ -4,10 +4,100 @@
 
 This directory contains a comprehensive collection of PostgreSQL DBA automation scripts, runbooks, and operational documentation for managing high-availability PostgreSQL clusters with repmgr, ProxySQL, and pgBackRest.
 
-**Last Updated**: 2026-01-17
+**Last Updated**: 2026-01-19
 **PostgreSQL Version**: 17.7 (Primary, Standby1, Standby2)
 **Environment**: AWS ap-northeast-1 (Tokyo)
 **Project Status**: PostgreSQL 17 HA Cluster with S3 Backups and ProxySQL
+
+---
+
+## PostgreSQL 17 Scripts Portfolio (Automated Deployment)
+
+### Complete Scripts List
+
+| # | Script | Purpose | Execute On | Documentation |
+|---|--------|---------|------------|---------------|
+| 1 | `1_PostgreSQL_17_HA_Deployment_Runbook.md` | Deployment documentation | Reference | - |
+| 2 | `2_generate_postgresql_17_ansible.sh` | Generate Ansible playbook for PG17+repmgr | Control Node | Auto-generates |
+| 3 | `3_pgBackRest_Standby_Backup_Setup_Runbook.md` | Backup configuration documentation | Reference | - |
+| 4 | `4_pgbackrest_standby_backup_setup.sh` | Configure pgBackRest with S3/EBS | STANDBY | Has execution logs |
+| 5 | `5_pgBackRest_Standby_Restore_Setup_Runbook.md` | Restore documentation | Reference | Has execution logs |
+| 6 | `6_pgbackrest_standby_setup.sh` | Restore new standby from S3/EBS | NEW STANDBY | Has execution logs |
+| 7 | `7_pgBackRest_S3_Standby_Restore_Complete_Guide.md` | S3 restore guide | Reference | - |
+| 8 | `8_setup_proxysql_postgresql17.sh` | Configure ProxySQL load balancer | ProxySQL Server | Has execution logs |
+
+### Deployment Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 POSTGRESQL 17 DEPLOYMENT WORKFLOW                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Step 1: Generate & Run Ansible Playbook (Script 2)                     │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ ./2_generate_postgresql_17_ansible.sh \                          │    │
+│  │     --cpu 16 --ram 64 --pg-version 17 \                         │    │
+│  │     --primary-ip 10.41.241.74 --standby-ip 10.41.241.191        │    │
+│  │                                                                  │    │
+│  │ cd postgresql-repmgr-ansible && ansible-playbook site.yml       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              │                                           │
+│                              ▼                                           │
+│  Step 2: Configure pgBackRest Backup (Script 4) - Run on STANDBY        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ export STORAGE_TYPE="s3"                                         │    │
+│  │ export S3_BUCKET="btse-stg-pgbackrest-backup"                   │    │
+│  │ export PRIMARY_IP="10.41.241.74"                                │    │
+│  │ ./4_pgbackrest_standby_backup_setup.sh                          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              │                                           │
+│                              ▼                                           │
+│  Step 3: (Optional) Add New Standby (Script 6) - Run on NEW STANDBY     │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ export RESTORE_SOURCE="s3"                                       │    │
+│  │ export S3_BUCKET="btse-stg-pgbackrest-backup"                   │    │
+│  │ export NEW_STANDBY_IP="10.41.241.171"                           │    │
+│  │ export NEW_NODE_ID="3" && export NEW_NODE_NAME="standby3"       │    │
+│  │ ./6_pgbackrest_standby_setup.sh                                 │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              │                                           │
+│                              ▼                                           │
+│  Step 4: Setup ProxySQL Load Balancer (Script 8)                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ export PRIMARY_HOST="10.41.241.74"                              │    │
+│  │ export STANDBY1_HOST="10.41.241.191"                            │    │
+│  │ export STANDBY2_HOST="10.41.241.171"                            │    │
+│  │ ./8_setup_proxysql_postgresql17.sh                              │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              │                                           │
+│                              ▼                                           │
+│                    ✅ CLUSTER READY                                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Quick Start Commands
+
+```bash
+# Step 1: PostgreSQL 17 + repmgr HA Cluster
+./2_generate_postgresql_17_ansible.sh --cpu 16 --ram 64 --pg-version 17 \
+    --primary-ip 10.41.241.74 --standby-ip 10.41.241.191 \
+    --data-dir /dbdata/pgsql/17/data
+cd postgresql-repmgr-ansible && ansible-playbook -i inventory.ini site.yml
+
+# Step 2: pgBackRest S3 Backup (on STANDBY)
+export STORAGE_TYPE="s3" S3_BUCKET="btse-stg-pgbackrest-backup" PRIMARY_IP="10.41.241.74"
+./4_pgbackrest_standby_backup_setup.sh
+
+# Step 3: Add New Standby from S3 (on NEW STANDBY)
+export RESTORE_SOURCE="s3" S3_BUCKET="btse-stg-pgbackrest-backup" PRIMARY_IP="10.41.241.74"
+export NEW_STANDBY_IP="10.41.241.171" NEW_NODE_ID="3" NEW_NODE_NAME="standby3"
+./6_pgbackrest_standby_setup.sh
+
+# Step 4: ProxySQL Setup
+export PRIMARY_HOST="10.41.241.74" STANDBY1_HOST="10.41.241.191" STANDBY2_HOST="10.41.241.171"
+./8_setup_proxysql_postgresql17.sh
+```
 
 ---
 
@@ -24,15 +114,28 @@ This directory contains a comprehensive collection of PostgreSQL DBA automation 
 ```
 s3://btse-stg-pgbackrest-backup/
 ├── pgbackrest/pg17_cluster/
-│   ├── archive/    # WAL archives
-│   └── backup/     # Full/incremental backups
-├── scripts/        # Automation scripts
-└── docs/           # Documentation
+│   ├── archive/                    # WAL archives
+│   └── backup/                     # Full/incremental backups
+├── scripts/
+│   ├── 2_generate_postgresql_17_ansible.sh
+│   ├── 4_pgbackrest_standby_backup_setup.sh
+│   ├── 6_pgbackrest_standby_setup.sh
+│   └── 8_setup_proxysql_postgresql17.sh
+└── docs/
+    ├── 1_PostgreSQL_17_HA_Deployment_Runbook.md
+    ├── 3_pgBackRest_Standby_Backup_Setup_Runbook.md
+    ├── 5_pgBackRest_Standby_Restore_Setup_Runbook.md
+    ├── 7_pgBackRest_S3_Standby_Restore_Complete_Guide.md
+    ├── PostgreSQL_17_HA_Complete_Blog.md
+    ├── PostgreSQL_SelfManaged_vs_ManagedServices_Comparison.md
+    ├── PROXYSQL_COMPLETE_GUIDE.md
+    └── pgBackRest_S3_CentOS7_Issue_Resolution.md
 ```
 
 ### Key Scripts for PostgreSQL 17
 | Script | Purpose | Download |
 |--------|---------|----------|
+| `2_generate_postgresql_17_ansible.sh` | Generate Ansible playbook | `aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/2_generate_postgresql_17_ansible.sh /tmp/` |
 | `4_pgbackrest_standby_backup_setup.sh` | Setup backups on standby | `aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/4_pgbackrest_standby_backup_setup.sh /tmp/` |
 | `6_pgbackrest_standby_setup.sh` | Restore new standby from S3 | `aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/6_pgbackrest_standby_setup.sh /tmp/` |
 | `8_setup_proxysql_postgresql17.sh` | Setup ProxySQL load balancer | `aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/8_setup_proxysql_postgresql17.sh /tmp/` |
@@ -1210,40 +1313,68 @@ PRIMARY (PostgreSQL 13.21)
 
 ## 🔄 Version History
 
-**2025-12-30** (Latest):
+**2026-01-19** (Latest):
+- ✅ **PostgreSQL 17 HA Cluster COMPLETED** (Staging Environment)
+- Created automated deployment scripts (2, 4, 6, 8)
+- S3 backup with pgBackRest working
+- ProxySQL read/write splitting configured
+- Created `PostgreSQL_SelfManaged_vs_ManagedServices_Comparison.md`
+- Created `pgBackRest_S3_CentOS7_Issue_Resolution.md` (Production RCA)
+- Updated all documentation with script references (no manual commands)
+
+**2026-01-17**:
+- ✅ **PostgreSQL 17 Scripts Created**
+- Created `2_generate_postgresql_17_ansible.sh` (Ansible generator)
+- Created `4_pgbackrest_standby_backup_setup.sh` (S3/EBS backup)
+- Created `6_pgbackrest_standby_setup.sh` (S3 standby restore)
+- Created `8_setup_proxysql_postgresql17.sh` (ProxySQL setup)
+- Created deployment runbooks (1, 3, 5, 7)
+
+**2025-12-30**:
 - ✅ **Phase 3 COMPLETED**: PostgreSQL 13 → 15 upgrade on standby4
-- ✅ Cross-version replication verified (PG 13 → PG 15)
-- Added `Phase3_PostgreSQL_15_Upgrade_Progress.md` (completed)
-- Updated master reference with correct architecture
-- Documented 10TB initial sync strategy
+- Cross-version replication verified (PG 13 → PG 15)
+- Added `Phase3_PostgreSQL_15_Upgrade_Progress.md`
 
 **2025-12-29**:
 - ✅ **Phase 2 COMPLETED**: pglogical setup
 - Added `Phase2_pglogical_Setup_Complete_Documentation.md`
-- Documented Option A vs Option B (Option B requires PG 16+)
-- Live replication testing completed
 
 **2025-12-20**:
-- Added `PostgreSQL_pglogical_CrossVersion_Upgrade_Runbook.md` (initial plan)
+- Added `PostgreSQL_pglogical_CrossVersion_Upgrade_Runbook.md`
 
 **2025-12-19**:
 - Created `pgBackREST_Complete_Workflow_Guide.md`
-- Set up backup automation on standby3
 
 **2025-12-15**:
 - Created `PostgreSQL_HA_Cluster_Complete_Guide.md`
 - Initial HA cluster setup completed
 
-**Current Versions**:
-- PostgreSQL: 13.21 (PRIMARY, Standby, Standby3), **15.10** (Standby4)
-- repmgr: 5.3.3
+**Current Versions (PostgreSQL 17 Staging)**:
+- PostgreSQL: **17.7** (Primary, Standby1, Standby2)
+- pgBackRest: 2.55.1
+- repmgr: 5.5.0
 - ProxySQL: 3.0.2
-- pglogical: 2.4.6
 - OS: Amazon Linux 2023
+
+**Current Versions (PostgreSQL 13/15 Legacy)**:
+- PostgreSQL: 13.21 (PRIMARY, Standby, Standby3), 15.10 (Standby4)
+- repmgr: 5.3.3
+- pglogical: 2.4.6
 
 ---
 
 ## 📋 Project Phases Summary
+
+### PostgreSQL 17 (Staging - NEW)
+
+| Phase | Description | Status | Documentation |
+|-------|-------------|--------|---------------|
+| Phase 1 | PG17 HA Cluster Setup | ✅ Complete | `1_PostgreSQL_17_HA_Deployment_Runbook.md` |
+| Phase 2 | pgBackRest S3 Backup | ✅ Complete | `3_pgBackRest_Standby_Backup_Setup_Runbook.md` |
+| Phase 3 | S3 Standby Restore | ✅ Complete | `5_pgBackRest_Standby_Restore_Setup_Runbook.md` |
+| Phase 4 | ProxySQL Load Balancer | ✅ Complete | `PROXYSQL_COMPLETE_GUIDE.md` |
+
+### PostgreSQL 13/15 (Legacy)
 
 | Phase | Description | Status | Documentation |
 |-------|-------------|--------|---------------|
@@ -1256,7 +1387,12 @@ PRIMARY (PostgreSQL 13.21)
 ---
 
 **Document**: Master Reference Guide
-**Version**: 2.0
+**Version**: 3.0
 **Created**: 2025-12-19
-**Last Updated**: 2025-12-30
+**Last Updated**: 2026-01-19
 **Location**: `/Users/rakeshtherani/Downloads/dba-automation/README_Master_Reference.md`
+
+**Change Log**:
+- v3.0 (2026-01-19): Added PostgreSQL 17 Scripts Portfolio with deployment workflow
+- v2.0 (2025-12-30): Added Phase 3 PostgreSQL 15 upgrade completion
+- v1.0 (2025-12-19): Initial version with PG13 documentation

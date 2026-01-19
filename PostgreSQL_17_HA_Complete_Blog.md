@@ -220,70 +220,84 @@ done
 
 ## 4. Phase 1: PostgreSQL 17 HA Cluster Setup
 
-### Step 1: Install PostgreSQL 17 on All Nodes
+### Automated Script: `2_generate_postgresql_17_ansible.sh`
+
+This script generates a complete Ansible playbook for PostgreSQL + repmgr deployment with hardware-aware configuration.
+
+### Script Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-c, --cpu` | CPU cores per node | 16 |
+| `-r, --ram` | RAM in GB per node | 64 |
+| `-p, --pg-version` | PostgreSQL version | 17 |
+| `-m, --repmgr-version` | repmgr version | 5.5.0 |
+| `--primary-ip` | Primary server IP | 10.41.241.74 |
+| `--standby-ip` | Standby server IP | 10.41.241.191 |
+| `-s, --storage` | Storage type (hdd/ssd) | hdd |
+| `-d, --data-dir` | Custom data directory | /var/lib/pgsql/VERSION/data |
+| `--install-postgres` | Install from PGDG repo | true |
+
+### Step 1: Generate Ansible Playbook
 
 ```bash
-# For Amazon Linux 2023
-sudo dnf install -y postgresql17-server postgresql17
+# Download script
+aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/2_generate_postgresql_17_ansible.sh /tmp/
+chmod +x /tmp/2_generate_postgresql_17_ansible.sh
 
-# Initialize database (PRIMARY only)
-sudo -u postgres /usr/pgsql-17/bin/initdb -D /dbdata/pgsql/17/data
-
-# Start PostgreSQL
-sudo -u postgres /usr/bin/pg_ctl -D /dbdata/pgsql/17/data start
+# Generate playbook with your configuration
+./2_generate_postgresql_17_ansible.sh \
+    --cpu 16 \
+    --ram 64 \
+    --pg-version 17 \
+    --repmgr-version 5.5.0 \
+    --primary-ip 10.41.241.74 \
+    --standby-ip 10.41.241.191 \
+    --storage ssd \
+    --data-dir /dbdata/pgsql/17/data
 ```
 
-### Step 2: Configure Primary Server
+### Step 2: Run Ansible Playbook
 
 ```bash
-# Edit postgresql.conf
-cat >> /dbdata/pgsql/17/data/postgresql.conf << EOF
+# Navigate to generated project
+cd postgresql-repmgr-ansible
 
-# Replication Settings
-wal_level = replica
-max_wal_senders = 16
-max_replication_slots = 16
-hot_standby = on
-archive_mode = on
-archive_command = 'pgbackrest --stanza=pg17_cluster archive-push %p'
+# Review inventory file
+cat inventory.ini
 
-# Performance
-max_connections = 600
-shared_buffers = 4GB
-effective_cache_size = 12GB
-EOF
-
-# Edit pg_hba.conf for replication
-cat >> /dbdata/pgsql/17/data/pg_hba.conf << EOF
-
-# Replication connections
-host    replication     repmgr          10.41.241.0/24          scram-sha-256
-host    repmgr          repmgr          10.41.241.0/24          scram-sha-256
-EOF
-
-# Restart PostgreSQL
-sudo -u postgres pg_ctl -D /dbdata/pgsql/17/data restart
+# Run the playbook
+ansible-playbook -i inventory.ini site.yml
 ```
 
-### Step 3: Create Replication User
+### What the Script Configures Automatically
 
-```sql
--- On PRIMARY
-CREATE USER repmgr WITH REPLICATION PASSWORD 'your_secure_password';
-CREATE DATABASE repmgr OWNER repmgr;
-```
+The script automatically configures:
 
-### Step 4: Setup Standby Servers
+1. **PostgreSQL Installation**
+   - Installs PostgreSQL 17 from PGDG repository
+   - Creates custom data directory structure
+   - Sets up proper permissions
 
-```bash
-# On STANDBY servers - use pg_basebackup
-sudo -u postgres pg_basebackup -h 10.41.241.74 -D /dbdata/pgsql/17/data -U repmgr -Fp -Xs -P -R
+2. **Performance Tuning** (based on CPU/RAM input)
+   - `shared_buffers` = RAM / 4
+   - `effective_cache_size` = RAM * 3/4
+   - `max_connections` based on RAM
+   - `work_mem`, `maintenance_work_mem` optimized
 
-# Start standby
-sudo -u postgres pg_ctl -D /dbdata/pgsql/17/data start
-```
+3. **Replication Settings**
+   - `wal_level = replica`
+   - `max_wal_senders = 16`
+   - `max_replication_slots = 16`
+   - `hot_standby = on`
 
-### Step 5: Verify Replication
+4. **repmgr Configuration**
+   - Creates repmgr user and database
+   - Configures `pg_hba.conf` for replication
+   - Registers primary and standby nodes
+   - Sets up automatic failover
+
+### Step 3: Verify Replication
 
 ```sql
 -- On PRIMARY
@@ -301,121 +315,149 @@ FROM pg_stat_replication;
 
 ## 5. Phase 2: pgBackRest Backup Configuration
 
-### Step 1: Install pgBackRest
+### Automated Script: `4_pgbackrest_standby_backup_setup.sh`
+
+This script handles complete pgBackRest setup including:
+- Installing pgBackRest from source
+- Configuring S3 or EBS backup repository
+- Setting up SSH keys between nodes
+- Creating initial stanza and backup
+- Configuring cron schedules
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PRIMARY_IP` | Primary PostgreSQL server | 10.41.241.74 |
+| `STANDBY_IP` | Standby server for backups | 10.41.241.191 |
+| `PG_VERSION` | PostgreSQL version | 17 |
+| `STANZA_NAME` | pgBackRest stanza name | pg17_cluster |
+| `STORAGE_TYPE` | Storage type (ebs/s3) | ebs |
+| `S3_BUCKET` | S3 bucket name (for S3 mode) | - |
+| `S3_REGION` | S3 region | ap-northeast-1 |
+| `CUSTOM_DATA_DIR` | PostgreSQL data directory | /dbdata/pgsql/17/data |
+| `BACKUP_MODE` | auto/setup/full/incr/skip | auto |
+
+### Step 1: Configure and Run Backup Setup
 
 ```bash
-# For Amazon Linux 2023 (compile from source)
-cd /tmp
-curl -L https://github.com/pgbackrest/pgbackrest/archive/release/2.55.1.tar.gz | tar xz
-cd pgbackrest-release-2.55.1
-meson setup build
-cd build
-ninja
-sudo ninja install
+# Download script
+aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/4_pgbackrest_standby_backup_setup.sh /tmp/
+chmod +x /tmp/4_pgbackrest_standby_backup_setup.sh
+
+# Set environment variables for S3 backup
+export PRIMARY_IP="10.41.241.74"
+export STANDBY_IP="10.41.241.191"
+export PG_VERSION="17"
+export STANZA_NAME="pg17_cluster"
+export STORAGE_TYPE="s3"
+export S3_BUCKET="btse-stg-pgbackrest-backup"
+export S3_REGION="ap-northeast-1"
+export CUSTOM_DATA_DIR="/dbdata/pgsql/17/data"
+
+# Run script (execute on STANDBY server)
+./4_pgbackrest_standby_backup_setup.sh
 ```
 
-### Step 2: Configure pgBackRest for S3
-
-Create `/etc/pgbackrest/pgbackrest.conf`:
-
-```ini
-[pg17_cluster]
-pg1-path=/dbdata/pgsql/17/data
-pg1-port=5432
-
-[global]
-# S3 Repository
-repo1-type=s3
-repo1-s3-bucket=btse-stg-pgbackrest-backup
-repo1-s3-region=ap-northeast-1
-repo1-s3-endpoint=s3.ap-northeast-1.amazonaws.com
-repo1-s3-key-type=auto
-repo1-path=/pgbackrest/pg17_cluster
-
-# Retention
-repo1-retention-full=7
-repo1-retention-diff=14
-
-# Performance
-process-max=8
-log-level-console=info
-log-level-file=detail
-log-path=/var/log/pgbackrest
-
-[global:archive-push]
-compress-level=3
-```
-
-### Step 3: Initialize Stanza
+### Alternative: EBS-Based Backup
 
 ```bash
-# Create stanza
-sudo -u postgres pgbackrest --stanza=pg17_cluster stanza-create
+# For EBS snapshot-based backup
+export STORAGE_TYPE="ebs"
+export BACKUP_VOLUME_SIZE="200"
+export AWS_REGION="ap-northeast-1"
+export AVAILABILITY_ZONE="ap-northeast-1a"
 
-# Verify configuration
-sudo -u postgres pgbackrest --stanza=pg17_cluster check
+./4_pgbackrest_standby_backup_setup.sh
 ```
 
-### Step 4: Create First Backup
+### What the Script Configures Automatically
+
+1. **pgBackRest Installation**
+   - Compiles pgBackRest 2.55.1 from source
+   - Creates log directories and configuration
+
+2. **SSH Key Setup**
+   - Configures passwordless SSH for `postgres` user
+   - Sets up SSH between primary and standby
+
+3. **pgBackRest Configuration** (auto-generated `/etc/pgbackrest/pgbackrest.conf`)
+   ```ini
+   [pg17_cluster]
+   pg1-path=/dbdata/pgsql/17/data
+   pg1-port=5432
+
+   [global]
+   repo1-type=s3
+   repo1-s3-bucket=btse-stg-pgbackrest-backup
+   repo1-s3-region=ap-northeast-1
+   repo1-s3-endpoint=s3.ap-northeast-1.amazonaws.com
+   repo1-s3-key-type=auto
+   repo1-path=/pgbackrest/pg17_cluster
+   repo1-retention-full=7
+   repo1-retention-diff=14
+   process-max=8
+   ```
+
+4. **Stanza Creation and Initial Backup**
+   - Creates stanza on primary and standby
+   - Takes initial full backup
+
+5. **Cron Schedule** (auto-configured)
+   ```bash
+   # Full backup - Sunday 2 AM
+   0 2 * * 0 /usr/bin/pgbackrest --stanza=pg17_cluster --type=full backup
+
+   # Differential backup - Daily 2 AM (except Sunday)
+   0 2 * * 1-6 /usr/bin/pgbackrest --stanza=pg17_cluster --type=diff backup
+   ```
+
+### Step 2: Verify Backup Setup
 
 ```bash
-# Full backup
-sudo -u postgres pgbackrest --stanza=pg17_cluster --type=full backup
-
-# Verify backup
+# Check backup info
 sudo -u postgres pgbackrest --stanza=pg17_cluster info
-```
 
-### Step 5: Setup Backup Schedule
-
-```bash
-# Add to crontab
-sudo -u postgres crontab -e
-
-# Add these entries:
-# Full backup - Sunday 2 AM
-0 2 * * 0 /usr/bin/pgbackrest --stanza=pg17_cluster --type=full backup
-
-# Differential backup - Daily 2 AM (except Sunday)
-0 2 * * 1-6 /usr/bin/pgbackrest --stanza=pg17_cluster --type=diff backup
+# Verify WAL archiving
+sudo -u postgres pgbackrest --stanza=pg17_cluster check
 ```
 
 ---
 
 ## 6. Phase 3: Adding New Standby from S3 Backup
 
-This is the key feature - restoring a new standby server directly from S3 backup.
+### Automated Script: `6_pgbackrest_standby_setup.sh`
 
-### Step 1: Prepare New Server
+This script handles complete standby restoration including:
+- Restoring from S3 or EBS snapshot
+- Point-in-Time Recovery (PITR) support
+- Configuring streaming replication
+- Registering with repmgr cluster
 
-```bash
-# Install PostgreSQL 17
-sudo dnf install -y postgresql17-server postgresql17
+### Environment Variables
 
-# Install pgBackRest (compile from source - see above)
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RESTORE_SOURCE` | Restore source (s3/ebs) | ebs |
+| `S3_BUCKET` | S3 bucket name | - |
+| `S3_REGION` | S3 region | ap-northeast-1 |
+| `PRIMARY_IP` | Primary PostgreSQL server | 10.41.241.74 |
+| `EXISTING_STANDBY_IP` | Existing standby (for config copy) | 10.41.241.191 |
+| `NEW_STANDBY_IP` | New standby server IP | - |
+| `NEW_NODE_ID` | repmgr node ID for new standby | 3 |
+| `NEW_NODE_NAME` | repmgr node name | standby2 |
+| `RECOVERY_TARGET` | Recovery target (latest/time/immediate) | latest |
+| `TARGET_TIME` | PITR timestamp (for time recovery) | - |
+| `TARGET_ACTION` | Action after recovery (pause/promote/shutdown) | promote |
 
-### Step 2: Configure SSH Keys
-
-```bash
-# Generate keys
-ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
-
-# Copy to PRIMARY
-ssh-copy-id root@10.41.241.74
-
-# Allow localhost SSH
-cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-```
-
-### Step 3: Run Restore Script
+### Step 1: Run Standby Restore Script (S3 Mode)
 
 ```bash
 # Download script from S3
 aws s3 cp s3://btse-stg-pgbackrest-backup/scripts/6_pgbackrest_standby_setup.sh /tmp/
 chmod +x /tmp/6_pgbackrest_standby_setup.sh
 
-# Set environment variables
+# Set environment variables for S3 restore
 export RESTORE_SOURCE="s3"
 export S3_BUCKET="btse-stg-pgbackrest-backup"
 export S3_REGION="ap-northeast-1"
@@ -426,11 +468,65 @@ export NEW_NODE_ID="3"
 export NEW_NODE_NAME="standby3"
 export RECOVERY_TARGET="latest"
 
-# Run script
+# Run script (execute on NEW STANDBY server)
 ./6_pgbackrest_standby_setup.sh
 ```
 
-### Step 4: Verify New Standby
+### Alternative: Point-in-Time Recovery (PITR)
+
+```bash
+# Restore to specific point in time
+export RESTORE_SOURCE="s3"
+export S3_BUCKET="btse-stg-pgbackrest-backup"
+export RECOVERY_TARGET="time"
+export TARGET_TIME="2026-01-16 14:30:00"
+export TARGET_ACTION="promote"
+
+./6_pgbackrest_standby_setup.sh
+```
+
+### Alternative: EBS Snapshot Restore
+
+```bash
+# Restore from EBS snapshot (faster for large databases)
+export RESTORE_SOURCE="ebs"
+export PRIMARY_IP="10.41.241.74"
+export NEW_NODE_ID="3"
+export NEW_NODE_NAME="standby3"
+
+./6_pgbackrest_standby_setup.sh
+```
+
+### What the Script Configures Automatically
+
+1. **Pre-flight Checks**
+   - Verifies SSH connectivity to primary and existing standby
+   - Checks S3 bucket access (for S3 mode)
+   - Validates pgBackRest backup availability
+
+2. **PostgreSQL Installation** (if needed)
+   - Installs PostgreSQL 17 from PGDG repository
+   - Creates data directory structure
+
+3. **pgBackRest Configuration**
+   - Copies configuration from existing standby
+   - Configures S3 repository access
+
+4. **Restore Operation**
+   - Restores database from S3/EBS backup
+   - Applies WAL for PITR if specified
+   - Creates `standby.signal` for streaming replication
+
+5. **Replication Setup**
+   - Configures `primary_conninfo` in `postgresql.auto.conf`
+   - Creates replication slot on primary
+   - Starts PostgreSQL in standby mode
+
+6. **repmgr Registration**
+   - Registers new node with repmgr cluster
+   - Verifies cluster status
+
+### Step 2: Verify New Standby
 
 ```bash
 # Check recovery mode
@@ -441,22 +537,43 @@ sudo -u postgres psql -c "SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_l
 
 # Check replication on PRIMARY
 sudo -u postgres psql -h 10.41.241.74 -c "SELECT application_name, client_addr, state FROM pg_stat_replication;"
+
+# Check repmgr cluster status
+sudo -u postgres /usr/pgsql-17/bin/repmgr cluster show
 ```
 
 ---
 
 ## 7. Phase 4: ProxySQL Load Balancer Setup
 
-### Step 1: Install ProxySQL
+### Automated Script: `8_setup_proxysql_postgresql17.sh`
 
-```bash
-# Download and install
-cd /tmp
-curl -LO https://github.com/sysown/proxysql/releases/download/v3.0.2/proxysql-3.0.2-1-almalinux9.x86_64.rpm
-rpm -ivh --nodeps proxysql-3.0.2-1-almalinux9.x86_64.rpm
-```
+This script handles complete ProxySQL setup including:
+- Installing ProxySQL 3.0.2
+- Configuring backend PostgreSQL servers
+- Setting up read/write query routing
+- Creating monitor and application users
+- Configuring connection pooling
 
-### Step 2: Run Setup Script
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PRIMARY_HOST` | Primary PostgreSQL server | 10.41.241.74 |
+| `STANDBY1_HOST` | First standby server | 10.41.241.191 |
+| `STANDBY2_HOST` | Second standby server | 10.41.241.171 |
+| `PROXYSQL_HOST` | ProxySQL server IP | (auto-detected) |
+| `PG_VERSION` | PostgreSQL version | 17 |
+| `PROXYSQL_ADMIN_PORT` | Admin interface port | 6132 |
+| `PROXYSQL_PGSQL_PORT` | PostgreSQL client port | 6133 |
+| `PROXYSQL_ADMIN_PASS` | Admin password | admin |
+| `MONITOR_USER` | Monitor user name | proxysql_monitor |
+| `MONITOR_PASS` | Monitor user password | (secure default) |
+| `APP_USER` | Application user name | app_user |
+| `APP_PASS` | Application user password | (secure default) |
+| `DB_NAME` | Default database | postgres |
+
+### Step 1: Run ProxySQL Setup Script
 
 ```bash
 # Download script
@@ -467,24 +584,52 @@ chmod +x /tmp/8_setup_proxysql_postgresql17.sh
 export PRIMARY_HOST="10.41.241.74"
 export STANDBY1_HOST="10.41.241.191"
 export STANDBY2_HOST="10.41.241.171"
+export PG_VERSION="17"
 export APP_USER="app_user"
 export APP_PASS="YourSecurePassword"
+export MONITOR_USER="proxysql_monitor"
+export MONITOR_PASS="Monitor_Password_2026!"
 
-# Run script
+# Run script (execute on ProxySQL server)
 ./8_setup_proxysql_postgresql17.sh
 ```
 
-### Step 3: Verify ProxySQL
+### What the Script Configures Automatically
 
-```bash
-# Check admin interface
-PGPASSWORD=admin psql -h 127.0.0.1 -p 6132 -U admin -d main -c "
-SELECT hostgroup_id, hostname, port, status
-FROM runtime_pgsql_servers;"
+1. **ProxySQL Installation**
+   - Downloads ProxySQL 3.0.2 RPM
+   - Installs with dependencies
+   - Starts ProxySQL service
 
-# Test application connection
-PGPASSWORD=YourSecurePassword psql -h 127.0.0.1 -p 6133 -U app_user -d postgres -c "SELECT 1;"
-```
+2. **PostgreSQL User Creation** (on PRIMARY)
+   - Creates monitor user for health checks
+   - Creates application user
+   - Grants appropriate permissions
+   - Updates `pg_hba.conf` on all nodes
+
+3. **Backend Server Configuration**
+   ```sql
+   -- Hostgroup 1: Primary (Read/Write)
+   INSERT INTO pgsql_servers VALUES (1, 'PRIMARY_HOST', 5432, 1);
+
+   -- Hostgroup 2: Standbys (Read-Only)
+   INSERT INTO pgsql_servers VALUES (2, 'STANDBY1_HOST', 5432, 1);
+   INSERT INTO pgsql_servers VALUES (2, 'STANDBY2_HOST', 5432, 1);
+   ```
+
+4. **Query Routing Rules**
+   ```sql
+   -- Route SELECT to standbys (hostgroup 2)
+   INSERT INTO pgsql_query_rules VALUES (..., '^SELECT.*', 2);
+
+   -- Route writes to primary (hostgroup 1)
+   INSERT INTO pgsql_query_rules VALUES (..., '^INSERT|^UPDATE|^DELETE', 1);
+   ```
+
+5. **Connection Pooling**
+   - Configures max connections per server
+   - Sets connection timeout values
+   - Enables connection reuse
 
 ### Query Routing Configuration
 
@@ -494,6 +639,23 @@ PGPASSWORD=YourSecurePassword psql -h 127.0.0.1 -p 6133 -U app_user -d postgres 
 | INSERT/UPDATE/DELETE | Primary | 1 |
 | BEGIN/COMMIT/ROLLBACK | Primary | 1 |
 | CREATE/DROP/ALTER | Primary | 1 |
+
+### Step 2: Verify ProxySQL Setup
+
+```bash
+# Check backend server status
+PGPASSWORD=admin psql -h 127.0.0.1 -p 6132 -U admin -d main -c "
+SELECT hostgroup_id, hostname, port, status
+FROM runtime_pgsql_servers;"
+
+# Check connection pool stats
+PGPASSWORD=admin psql -h 127.0.0.1 -p 6132 -U admin -d main -c "
+SELECT hostgroup, srv_host, status, ConnUsed, ConnFree, ConnOK, ConnERR
+FROM stats_pgsql_connection_pool;"
+
+# Test application connection
+PGPASSWORD=YourSecurePassword psql -h 127.0.0.1 -p 6133 -U app_user -d postgres -c "SELECT 1;"
+```
 
 ---
 
@@ -574,27 +736,112 @@ sudo -u postgres pgbackrest --stanza=pg17_cluster \
 
 ## 10. Scripts Reference
 
-| Script | Purpose | Location |
-|--------|---------|----------|
-| `1_PostgreSQL_17_HA_Deployment_Runbook.md` | Initial HA cluster setup | Local |
-| `3_pgBackRest_Standby_Backup_Setup_Runbook.md` | Backup configuration | Local |
-| `4_pgbackrest_standby_backup_setup.sh` | Backup setup automation | S3 |
-| `6_pgbackrest_standby_setup.sh` | S3 standby restore | S3 |
-| `7_pgBackRest_S3_Standby_Restore_Complete_Guide.md` | S3 restore documentation | S3/Local |
-| `8_setup_proxysql_postgresql17.sh` | ProxySQL setup | S3 |
-| `verify_proxysql.sh` | ProxySQL health check | Local |
-| `monitor_proxysql.sh` | ProxySQL monitoring | Local |
+### Complete Scripts Portfolio
+
+| # | Script | Purpose | Execute On |
+|---|--------|---------|------------|
+| 1 | `1_PostgreSQL_17_HA_Deployment_Runbook.md` | Deployment documentation | Reference |
+| 2 | `2_generate_postgresql_17_ansible.sh` | Generate Ansible playbook for PG17+repmgr | Control Node |
+| 3 | `3_pgBackRest_Standby_Backup_Setup_Runbook.md` | Backup configuration documentation | Reference |
+| 4 | `4_pgbackrest_standby_backup_setup.sh` | Configure pgBackRest with S3/EBS | STANDBY |
+| 5 | `5_pgBackRest_Standby_Restore_Setup_Runbook.md` | Restore documentation | Reference |
+| 6 | `6_pgbackrest_standby_setup.sh` | Restore new standby from S3/EBS | NEW STANDBY |
+| 7 | `7_pgBackRest_S3_Standby_Restore_Complete_Guide.md` | S3 restore guide | Reference |
+| 8 | `8_setup_proxysql_postgresql17.sh` | Configure ProxySQL load balancer | ProxySQL Server |
+
+### Quick Reference: Script Usage
+
+#### Script 2: PostgreSQL 17 HA Cluster Setup
+```bash
+./2_generate_postgresql_17_ansible.sh \
+    --cpu 16 --ram 64 \
+    --pg-version 17 \
+    --primary-ip 10.41.241.74 \
+    --standby-ip 10.41.241.191 \
+    --data-dir /dbdata/pgsql/17/data
+
+cd postgresql-repmgr-ansible
+ansible-playbook -i inventory.ini site.yml
+```
+
+#### Script 4: pgBackRest Backup Setup
+```bash
+export PRIMARY_IP="10.41.241.74"
+export STANDBY_IP="10.41.241.191"
+export STORAGE_TYPE="s3"
+export S3_BUCKET="btse-stg-pgbackrest-backup"
+./4_pgbackrest_standby_backup_setup.sh
+```
+
+#### Script 6: Standby Restore from S3
+```bash
+export RESTORE_SOURCE="s3"
+export S3_BUCKET="btse-stg-pgbackrest-backup"
+export PRIMARY_IP="10.41.241.74"
+export NEW_STANDBY_IP="10.41.241.171"
+export NEW_NODE_ID="3"
+export NEW_NODE_NAME="standby3"
+./6_pgbackrest_standby_setup.sh
+```
+
+#### Script 8: ProxySQL Setup
+```bash
+export PRIMARY_HOST="10.41.241.74"
+export STANDBY1_HOST="10.41.241.191"
+export STANDBY2_HOST="10.41.241.171"
+export APP_USER="app_user"
+export APP_PASS="YourSecurePassword"
+./8_setup_proxysql_postgresql17.sh
+```
 
 ### Script Locations in S3
 
 ```
 s3://btse-stg-pgbackrest-backup/
 ├── scripts/
+│   ├── 2_generate_postgresql_17_ansible.sh
 │   ├── 4_pgbackrest_standby_backup_setup.sh
 │   ├── 6_pgbackrest_standby_setup.sh
 │   └── 8_setup_proxysql_postgresql17.sh
 └── docs/
+    ├── 1_PostgreSQL_17_HA_Deployment_Runbook.md
+    ├── 3_pgBackRest_Standby_Backup_Setup_Runbook.md
+    ├── 5_pgBackRest_Standby_Restore_Setup_Runbook.md
     └── 7_pgBackRest_S3_Standby_Restore_Complete_Guide.md
+```
+
+### Deployment Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     DEPLOYMENT WORKFLOW                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Step 1: Generate & Run Ansible Playbook                                │
+│  ┌─────────────────────────────────────┐                                │
+│  │ ./2_generate_postgresql_17_ansible.sh │ ──► Creates Ansible project  │
+│  │ ansible-playbook site.yml            │ ──► Deploys PG17 + repmgr    │
+│  └─────────────────────────────────────┘                                │
+│                    │                                                     │
+│                    ▼                                                     │
+│  Step 2: Configure pgBackRest Backup (on STANDBY)                       │
+│  ┌─────────────────────────────────────┐                                │
+│  │ ./4_pgbackrest_standby_backup_setup.sh │ ──► S3/EBS backup setup    │
+│  └─────────────────────────────────────┘                                │
+│                    │                                                     │
+│                    ▼                                                     │
+│  Step 3: (Optional) Add New Standby                                     │
+│  ┌─────────────────────────────────────┐                                │
+│  │ ./6_pgbackrest_standby_setup.sh      │ ──► Restore from S3/EBS      │
+│  └─────────────────────────────────────┘                                │
+│                    │                                                     │
+│                    ▼                                                     │
+│  Step 4: Setup ProxySQL Load Balancer                                   │
+│  ┌─────────────────────────────────────┐                                │
+│  │ ./8_setup_proxysql_postgresql17.sh   │ ──► Read/Write routing       │
+│  └─────────────────────────────────────┘                                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -706,6 +953,10 @@ For questions or issues, refer to the troubleshooting section or check the indiv
 
 ---
 
-**Document Version**: 1.0
-**Last Updated**: 2026-01-17
+**Document Version**: 2.0
+**Last Updated**: 2026-01-19
 **Author**: DBA Automation Team
+
+**Change Log**:
+- v2.0 (2026-01-19): Updated all phases to reference automation scripts instead of manual commands
+- v1.0 (2026-01-17): Initial document with manual deployment steps
