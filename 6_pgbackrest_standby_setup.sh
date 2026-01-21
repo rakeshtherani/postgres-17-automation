@@ -78,7 +78,8 @@ readonly PG_DATA_DIR="/dbdata/pgsql/${PG_VERSION}/data"
 readonly PG_BIN_DIR="/usr/pgsql-${PG_VERSION}/bin"
 readonly BACKUP_MOUNT_POINT="/backup/pgbackrest"
 readonly BACKUP_DEVICE="/dev/xvdb"
-readonly REPLICATION_SLOT_NAME="${NEW_NODE_NAME}_slot"
+# Sanitize slot name: replace hyphens with underscores (PostgreSQL slot names only allow [a-z0-9_])
+readonly REPLICATION_SLOT_NAME="$(echo "${NEW_NODE_NAME}_slot" | tr '-' '_')"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOG_FILE="${SCRIPT_DIR}/pgbackrest_standby_setup_$(date +%Y%m%d_%H%M%S).log"
 readonly STATE_FILE="${SCRIPT_DIR}/pgbackrest_standby_state.env"
@@ -138,12 +139,36 @@ execute_remote() {
     local description="${3:-Executing remote command}"
 
     log "Executing on $host: $description"
-    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "root@$host" "$command"; then
-        log_success "Command executed successfully on $host"
-        return 0
+
+    # Check if target host is local machine - run locally instead of SSH
+    local LOCAL_IPS=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$')
+    local IS_LOCAL=false
+
+    for ip in $LOCAL_IPS; do
+        if [[ "$ip" == "$host" ]]; then
+            IS_LOCAL=true
+            break
+        fi
+    done
+
+    if [[ "$IS_LOCAL" == "true" ]]; then
+        # Run locally - no SSH needed
+        if bash -c "$command"; then
+            log_success "Command executed successfully on $host"
+            return 0
+        else
+            log_error "Command failed on $host: $command"
+            return 1
+        fi
     else
-        log_error "Command failed on $host: $command"
-        return 1
+        # Run via SSH for remote hosts
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "root@$host" "$command"; then
+            log_success "Command executed successfully on $host"
+            return 0
+        else
+            log_error "Command failed on $host: $command"
+            return 1
+        fi
     fi
 }
 
@@ -1134,40 +1159,41 @@ build_restore_command() {
     local restore_cmd="pgbackrest --stanza=$STANZA_NAME"
 
     # Add recovery target options based on RECOVERY_TARGET
+    # NOTE: log_info calls redirect to stderr to avoid capture in command substitution
     case "$RECOVERY_TARGET" in
         "time")
             if [[ -n "$TARGET_TIME" ]]; then
                 restore_cmd="$restore_cmd --type=time --target=\"$TARGET_TIME\""
-                log_info "PITR: Restoring to time: $TARGET_TIME"
+                log_info "PITR: Restoring to time: $TARGET_TIME" >&2
             else
-                log_error "TARGET_TIME is required when RECOVERY_TARGET=time"
+                log_error "TARGET_TIME is required when RECOVERY_TARGET=time" >&2
                 exit 1
             fi
             ;;
         "immediate")
             restore_cmd="$restore_cmd --type=immediate"
-            log_info "PITR: Restoring to end of backup (immediate)"
+            log_info "PITR: Restoring to end of backup (immediate)" >&2
             ;;
         "name")
             if [[ -n "$TARGET_NAME" ]]; then
                 restore_cmd="$restore_cmd --type=name --target=\"$TARGET_NAME\""
-                log_info "PITR: Restoring to named point: $TARGET_NAME"
+                log_info "PITR: Restoring to named point: $TARGET_NAME" >&2
             else
-                log_error "TARGET_NAME is required when RECOVERY_TARGET=name"
+                log_error "TARGET_NAME is required when RECOVERY_TARGET=name" >&2
                 exit 1
             fi
             ;;
         "lsn")
             if [[ -n "$TARGET_LSN" ]]; then
                 restore_cmd="$restore_cmd --type=lsn --target=\"$TARGET_LSN\""
-                log_info "PITR: Restoring to LSN: $TARGET_LSN"
+                log_info "PITR: Restoring to LSN: $TARGET_LSN" >&2
             else
-                log_error "TARGET_LSN is required when RECOVERY_TARGET=lsn"
+                log_error "TARGET_LSN is required when RECOVERY_TARGET=lsn" >&2
                 exit 1
             fi
             ;;
         "latest"|*)
-            log_info "Restoring to latest available backup"
+            log_info "Restoring to latest available backup" >&2
             ;;
     esac
 
@@ -1430,7 +1456,9 @@ host    postgres        repmgr          $NEW_STANDBY_IP/32      trust' $PG_DATA_
 }
 
 #===============================================================================
-# Step 8: Configure and Start New Standby (FIXED)
+# Step 8: Configure and Start New Standby (FIXED v2 - Jan 2026)
+# Fixes: Install repmgr if missing, dynamic pg_bindir, systemctl enable,
+#        verify primary_conninfo, proper error handling
 #===============================================================================
 
 configure_new_standby() {
@@ -1462,53 +1490,16 @@ host    postgres        repmgr          $NEW_STANDBY_IP/32      trust
 host    all             all             10.0.0.0/8              scram-sha-256
 EOF
 
-        # Find and configure repmgr
-        REPMGR_PATH=''
-        echo 'Checking for repmgr installation...'
-
-        for path in /usr/local/pgsql/bin/repmgr /usr/local/bin/repmgr /usr/pgsql-${PG_VERSION}/bin/repmgr /usr/bin/repmgr; do
-            if [ -x \"\$path\" ] && \"\$path\" --version &>/dev/null; then
-                REPMGR_PATH=\"\$path\"
-                echo \"Found working repmgr at: \$path\"
-                break
-            fi
-        done
-
-        if [ -z \"\$REPMGR_PATH\" ]; then
-            echo 'repmgr not found - PostgreSQL will work without cluster management'
-        fi
-
-        # Configure repmgr
-        if [ -n \"\$REPMGR_PATH\" ]; then
-            sudo mkdir -p /var/lib/pgsql
-            sudo chown postgres:postgres /var/lib/pgsql
-            cat << EOF | sudo -u postgres tee /var/lib/pgsql/repmgr.conf > /dev/null
-node_id=$NEW_NODE_ID
-node_name='$NEW_NODE_NAME'
-conninfo='host=$NEW_STANDBY_IP user=repmgr dbname=repmgr connect_timeout=2'
-data_directory='$PG_DATA_DIR'
-config_directory='$PG_DATA_DIR'
-log_level=INFO
-log_file='/var/log/repmgr/repmgr.log'
-pg_bindir='/usr/local/pgsql/bin'
-repmgrd_service_start_command='sudo systemctl start repmgrd'
-repmgrd_service_stop_command='sudo systemctl stop repmgrd'
-EOF
-
-            # Create log directory
-            sudo mkdir -p /var/log/repmgr
-            sudo chown postgres:postgres /var/log/repmgr
-        fi
-
-        # Start PostgreSQL using pg_ctl (most reliable cross-distro method)
-        echo 'Starting PostgreSQL using pg_ctl...'
-
-        # Find pg_ctl binary
+        # Find pg_ctl binary FIRST (needed for pg_bindir in repmgr.conf)
+        echo 'Finding PostgreSQL binaries...'
         PG_CTL_BIN=''
+        PG_BIN_DIR=''
         for pgctl_path in /usr/pgsql-${PG_VERSION}/bin/pg_ctl /usr/bin/pg_ctl /usr/local/pgsql/bin/pg_ctl; do
             if [ -x \"\$pgctl_path\" ]; then
                 PG_CTL_BIN=\"\$pgctl_path\"
+                PG_BIN_DIR=\"\$(dirname \$pgctl_path)\"
                 echo \"Found pg_ctl at: \$pgctl_path\"
+                echo \"PostgreSQL bin directory: \$PG_BIN_DIR\"
                 break
             fi
         done
@@ -1517,6 +1508,197 @@ EOF
             echo 'ERROR: pg_ctl not found'
             exit 1
         fi
+
+        # Find and configure repmgr - INSTALL IF NOT FOUND
+        REPMGR_PATH=''
+        echo 'Checking for repmgr installation...'
+
+        for path in /usr/local/pgsql/bin/repmgr /usr/local/bin/repmgr /usr/pgsql-${PG_VERSION}/bin/repmgr /usr/bin/repmgr \$PG_BIN_DIR/repmgr; do
+            if [ -x \"\$path\" ] && \"\$path\" --version &>/dev/null; then
+                REPMGR_PATH=\"\$path\"
+                echo \"Found working repmgr at: \$path\"
+                break
+            fi
+        done
+
+        # INSTALL REPMGR IF NOT FOUND
+        if [ -z \"\$REPMGR_PATH\" ]; then
+            echo 'repmgr not found - INSTALLING repmgr...'
+
+            # Try package manager first (Amazon Linux 2023 / RHEL)
+            if command -v dnf &>/dev/null; then
+                echo 'Attempting to install repmgr via dnf...'
+                sudo dnf install -y repmgr_${PG_VERSION} 2>/dev/null || sudo dnf install -y repmgr${PG_VERSION} 2>/dev/null || true
+            elif command -v yum &>/dev/null; then
+                echo 'Attempting to install repmgr via yum...'
+                sudo yum install -y repmgr_${PG_VERSION} 2>/dev/null || sudo yum install -y repmgr${PG_VERSION} 2>/dev/null || true
+            fi
+
+            # Check again after package install attempt
+            for path in /usr/pgsql-${PG_VERSION}/bin/repmgr /usr/bin/repmgr /usr/local/bin/repmgr; do
+                if [ -x \"\$path\" ] && \"\$path\" --version &>/dev/null; then
+                    REPMGR_PATH=\"\$path\"
+                    echo \"Successfully installed repmgr at: \$path\"
+                    break
+                fi
+            done
+
+            # If still not found, compile from source
+            if [ -z \"\$REPMGR_PATH\" ]; then
+                echo 'Package install failed - compiling repmgr from source...'
+
+                # Install ALL build dependencies for Amazon Linux 2023
+                if command -v dnf &>/dev/null; then
+                    echo 'Installing build dependencies...'
+                    # IMPORTANT: postgresql17-static provides libpgcommon.a and libpgport.a required for repmgr linking
+                    sudo dnf install -y gcc make readline-devel openssl-devel libxml2-devel \
+                        postgresql${PG_VERSION}-server-devel postgresql${PG_VERSION}-static \
+                        flex libcurl-devel json-c-devel libxslt-devel pam-devel lz4-devel 2>&1 | tail -15
+
+                    # Verify static libraries are now available
+                    echo 'Verifying PostgreSQL static libraries...'
+                    if [ -f /usr/lib64/libpgcommon.a ]; then
+                        echo 'Found: /usr/lib64/libpgcommon.a'
+                    else
+                        echo 'WARNING: libpgcommon.a not found after installing postgresql17-static'
+                    fi
+                    if [ -f /usr/lib64/libpgport.a ]; then
+                        echo 'Found: /usr/lib64/libpgport.a'
+                    else
+                        echo 'WARNING: libpgport.a not found after installing postgresql17-static'
+                    fi
+                fi
+
+                # Download and compile repmgr
+                cd /tmp
+                REPMGR_VERSION=\"5.5.0\"
+                if [ ! -f \"repmgr-\${REPMGR_VERSION}.tar.gz\" ]; then
+                    curl -L -o repmgr-\${REPMGR_VERSION}.tar.gz https://github.com/EnterpriseDB/repmgr/archive/refs/tags/v\${REPMGR_VERSION}.tar.gz
+                fi
+
+                rm -rf repmgr-\${REPMGR_VERSION}
+                tar xzf repmgr-\${REPMGR_VERSION}.tar.gz
+                cd repmgr-\${REPMGR_VERSION}
+
+                # Find pg_config - check multiple locations including Amazon Linux paths
+                PG_CONFIG=''
+                echo 'Searching for pg_config...'
+
+                # First try: use which command
+                PG_CONFIG=\$(which pg_config 2>/dev/null || true)
+                if [ -n \"\$PG_CONFIG\" ] && [ -x \"\$PG_CONFIG\" ]; then
+                    echo \"Found pg_config via which: \$PG_CONFIG\"
+                else
+                    # Second try: check common paths
+                    for pgcfg in /usr/bin/pg_config /usr/pgsql-17/bin/pg_config /usr/local/pgsql/bin/pg_config \$PG_BIN_DIR/pg_config; do
+                        echo \"Checking: \$pgcfg\"
+                        if [ -f \"\$pgcfg\" ] && [ -x \"\$pgcfg\" ]; then
+                            PG_CONFIG=\"\$pgcfg\"
+                            echo \"Found pg_config at: \$pgcfg\"
+                            break
+                        fi
+                    done
+                fi
+
+                # Third try: find command as last resort
+                if [ -z \"\$PG_CONFIG\" ]; then
+                    echo 'Searching with find command...'
+                    PG_CONFIG=\$(find /usr -name pg_config -type f 2>/dev/null | head -1)
+                    if [ -n \"\$PG_CONFIG\" ]; then
+                        echo \"Found pg_config via find: \$PG_CONFIG\"
+                    fi
+                fi
+
+                if [ -n \"\$PG_CONFIG\" ] && [ -x \"\$PG_CONFIG\" ]; then
+                    echo \"Compiling repmgr with pg_config: \$PG_CONFIG\"
+                    ./configure --prefix=/usr/local --with-pgconfig=\$PG_CONFIG 2>&1
+                    make -j\$(nproc) 2>&1
+                    sudo make install 2>&1
+
+                    # Check multiple locations - repmgr may install to /usr/bin based on pg_config
+                    for repmgr_check in /usr/local/bin/repmgr /usr/bin/repmgr; do
+                        if [ -x \"\$repmgr_check\" ]; then
+                            REPMGR_PATH=\"\$repmgr_check\"
+                            echo \"Successfully compiled repmgr at: \$REPMGR_PATH\"
+                            break
+                        fi
+                    done
+
+                    if [ -z \"\$REPMGR_PATH\" ]; then
+                        echo 'ERROR: repmgr compilation failed - binary not found'
+                        exit 1
+                    fi
+                else
+                    echo 'ERROR: pg_config not found - cannot compile repmgr'
+                    echo 'Please install postgresql-devel or postgresql17-server-devel'
+                    exit 1
+                fi
+
+                cd /tmp
+            fi
+        fi
+
+        # Verify repmgr is now available - MANDATORY
+        if [ -z \"\$REPMGR_PATH\" ]; then
+            echo 'ERROR: repmgr installation FAILED - cannot proceed'
+            echo 'REPMGR_INSTALLED=false'
+            echo 'repmgr is REQUIRED for HA cluster setup. Aborting.'
+            exit 1
+        else
+            echo 'REPMGR_INSTALLED=true'
+            echo \"repmgr version: \$(\$REPMGR_PATH --version)\"
+        fi
+
+        # Get repmgr bin directory
+        REPMGR_BIN_DIR=''
+        if [ -n \"\$REPMGR_PATH\" ]; then
+            REPMGR_BIN_DIR=\"\$(dirname \$REPMGR_PATH)\"
+        fi
+
+        # Configure repmgr.conf with DYNAMIC paths
+        if [ -n \"\$REPMGR_PATH\" ]; then
+            sudo mkdir -p /var/lib/pgsql
+            sudo chown postgres:postgres /var/lib/pgsql
+
+            # Create log directory
+            sudo mkdir -p /var/log/repmgr
+            sudo chown postgres:postgres /var/log/repmgr
+
+            # Write repmgr.conf using printf (avoids nested heredoc issues)
+            printf '%s\n' \"node_id=$NEW_NODE_ID\" \"node_name='$NEW_NODE_NAME'\" \"conninfo='host=$NEW_STANDBY_IP user=repmgr dbname=repmgr connect_timeout=2'\" \"data_directory='$PG_DATA_DIR'\" \"config_directory='$PG_DATA_DIR'\" \"log_level=INFO\" \"log_file='/var/log/repmgr/repmgr.log'\" \"pg_bindir='/usr/bin'\" \"repmgr_bindir='/usr/bin'\" \"use_replication_slots=true\" \"failover=automatic\" \"promote_command='/usr/bin/repmgr standby promote -f /var/lib/pgsql/repmgr.conf --log-to-file'\" \"follow_command='/usr/bin/repmgr standby follow -f /var/lib/pgsql/repmgr.conf --log-to-file --upstream-node-id=%n'\" | sudo tee /var/lib/pgsql/repmgr.conf > /dev/null
+
+            sudo chown postgres:postgres /var/lib/pgsql/repmgr.conf
+
+            echo 'repmgr.conf created successfully:'
+            cat /var/lib/pgsql/repmgr.conf
+        fi
+
+        # Verify primary_conninfo is configured
+        echo 'Verifying primary_conninfo configuration...'
+        if grep -q 'primary_conninfo' $PG_DATA_DIR/postgresql.auto.conf 2>/dev/null; then
+            echo 'primary_conninfo found in postgresql.auto.conf'
+            grep primary_conninfo $PG_DATA_DIR/postgresql.auto.conf
+        elif grep -q 'primary_conninfo' $PG_DATA_DIR/postgresql.conf 2>/dev/null; then
+            echo 'primary_conninfo found in postgresql.conf'
+            grep primary_conninfo $PG_DATA_DIR/postgresql.conf
+        else
+            echo 'WARNING: primary_conninfo NOT FOUND - Adding it now...'
+            cat << EOF | sudo -u postgres tee -a $PG_DATA_DIR/postgresql.auto.conf > /dev/null
+
+# Standby replication configuration - Added by setup script
+primary_conninfo = 'host=$PRIMARY_IP port=5432 user=repmgr dbname=repmgr application_name=$NEW_NODE_NAME connect_timeout=2'
+primary_slot_name = '$REPLICATION_SLOT_NAME'
+EOF
+            echo 'primary_conninfo added to postgresql.auto.conf'
+        fi
+
+        # Verify standby.signal exists
+        if [ ! -f $PG_DATA_DIR/standby.signal ]; then
+            echo 'Creating standby.signal file...'
+            sudo -u postgres touch $PG_DATA_DIR/standby.signal
+        fi
+        echo 'standby.signal exists: '
+        ls -la $PG_DATA_DIR/standby.signal
 
         # Create log directory if needed
         mkdir -p $PG_DATA_DIR/log
@@ -1550,13 +1732,38 @@ EOF
             exit 1
         fi
 
+        # ENABLE PostgreSQL service for auto-start on boot
+        echo 'Enabling PostgreSQL service for auto-start...'
+        if systemctl list-unit-files | grep -q postgresql-${PG_VERSION}; then
+            sudo systemctl enable postgresql-${PG_VERSION}.service 2>/dev/null || true
+            echo 'PostgreSQL service enabled for auto-start'
+        else
+            echo 'WARNING: systemd service postgresql-${PG_VERSION} not found'
+            echo 'Consider creating a systemd service or using pg_ctl in rc.local'
+        fi
+
         # Check recovery status
         echo 'Checking recovery status...'
         RECOVERY_STATUS=\$(cd /tmp && sudo -u postgres psql -t -c 'SELECT pg_is_in_recovery();' | xargs)
         if [ \"\$RECOVERY_STATUS\" = \"t\" ]; then
             echo 'PostgreSQL is in recovery mode - standby setup successful'
         else
-            echo 'WARNING: PostgreSQL is not in recovery mode - may not be properly configured as standby'
+            echo 'ERROR: PostgreSQL is NOT in recovery mode - standby configuration FAILED'
+            echo 'Checking configuration...'
+            cd /tmp && sudo -u postgres psql -c \"SHOW primary_conninfo;\"
+            cd /tmp && sudo -u postgres psql -c \"SHOW primary_slot_name;\"
+            exit 1
+        fi
+
+        # Verify replication is working
+        echo 'Verifying replication connection to primary...'
+        WAL_RECEIVER=\$(cd /tmp && sudo -u postgres psql -t -c \"SELECT count(*) FROM pg_stat_wal_receiver WHERE status='streaming';\" | xargs)
+        if [ \"\$WAL_RECEIVER\" = \"1\" ]; then
+            echo 'WAL receiver is streaming from primary - replication WORKING'
+        else
+            echo 'WARNING: WAL receiver not streaming yet - may need time to connect'
+            echo 'WAL receiver status:'
+            cd /tmp && sudo -u postgres psql -c 'SELECT * FROM pg_stat_wal_receiver;'
         fi
 
         # Show replication status
@@ -1571,7 +1778,8 @@ EOF
 }
 
 #===============================================================================
-# Step 9: Register with repmgr and Final Verification
+# Step 9: Register with repmgr and Final Verification (FIXED v2 - Jan 2026)
+# Fixes: Proper error handling - FAIL if repmgr not found, don't report false success
 #===============================================================================
 
 register_with_repmgr() {
@@ -1596,52 +1804,127 @@ register_with_repmgr() {
         fi
     " "Testing connections"
 
-    # Register standby with repmgr if available
-    execute_remote "$NEW_STANDBY_IP" "
-        # Find repmgr binary
-        REPMGR_PATH=''
-        for path in /usr/local/pgsql/bin/repmgr /usr/local/bin/repmgr /usr/pgsql-${PG_VERSION}/bin/repmgr /usr/bin/repmgr; do
-            if [ -x \"\$path\" ] && \"\$path\" --version &>/dev/null; then
-                REPMGR_PATH=\"\$path\"
-                break
-            fi
-        done
+    # Register standby with repmgr - find repmgr locally first
+    log_info "Finding repmgr binary..."
+    local REPMGR_PATH=""
 
-        if [ -z \"\$REPMGR_PATH\" ]; then
-            echo 'repmgr not found - skipping cluster registration'
-            echo 'PostgreSQL replication is working without repmgr cluster management'
-            exit 0
+    # Check locally for repmgr (since we're likely running on the standby)
+    for path in /usr/bin/repmgr /usr/local/bin/repmgr /usr/pgsql-17/bin/repmgr; do
+        if [ -x "$path" ]; then
+            REPMGR_PATH="$path"
+            log_info "Found repmgr at: $REPMGR_PATH"
+            break
         fi
+    done
 
+    # Also try which
+    if [ -z "$REPMGR_PATH" ]; then
+        REPMGR_PATH=$(which repmgr 2>/dev/null || true)
+        if [ -n "$REPMGR_PATH" ] && [ -x "$REPMGR_PATH" ]; then
+            log_info "Found repmgr via which: $REPMGR_PATH"
+        else
+            REPMGR_PATH=""
+        fi
+    fi
+
+    if [ -z "$REPMGR_PATH" ]; then
+        log_error "repmgr is NOT installed - cannot proceed"
+        save_state "REPMGR_REGISTERED" "false"
+        save_state "REPMGR_STATUS" "NOT_INSTALLED"
+        exit 1
+    fi
+
+    log_info "Using repmgr: $REPMGR_PATH"
+    log_info "repmgr version: $($REPMGR_PATH --version)"
+
+    # Register standby with repmgr
+    local REPMGR_RESULT
+    REPMGR_RESULT=$(execute_remote "$NEW_STANDBY_IP" "
+        REPMGR_PATH='$REPMGR_PATH'
         echo \"Using repmgr at: \$REPMGR_PATH\"
+        echo \"REPMGR_STATUS=INSTALLED\"
 
         # Test repmgr configuration
         if cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" --version; then
             echo 'repmgr version check successful'
         else
-            echo 'repmgr version check failed'
-            exit 0
+            echo 'ERROR: repmgr version check failed'
+            echo 'REPMGR_STATUS=VERSION_CHECK_FAILED'
+            exit 1
         fi
+
+        # Check if repmgr.conf exists
+        if [ ! -f /var/lib/pgsql/repmgr.conf ]; then
+            echo 'ERROR: /var/lib/pgsql/repmgr.conf NOT FOUND'
+            echo 'REPMGR_STATUS=CONFIG_MISSING'
+            exit 1
+        fi
+
+        echo 'repmgr.conf found:'
+        cat /var/lib/pgsql/repmgr.conf
 
         # Try to show cluster first
         echo 'Testing repmgr cluster configuration...'
-        cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show || echo 'Cluster show test completed'
+        cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show 2>&1 || true
 
         # Register with repmgr
         echo 'Registering standby with repmgr...'
-        if cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf standby register --upstream-node-id=1 --force; then
+        if cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf standby register --upstream-node-id=1 --force 2>&1; then
+            echo 'REPMGR_STATUS=REGISTERED'
             echo 'Registration successful'
         else
-            echo 'Registration attempted (may already be registered or have connectivity issues)'
+            # Check if already registered
+            if cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show 2>&1 | grep -q '$NEW_NODE_NAME'; then
+                echo 'REPMGR_STATUS=ALREADY_REGISTERED'
+                echo 'Node already registered in cluster'
+            else
+                echo 'REPMGR_STATUS=REGISTRATION_FAILED'
+                echo 'ERROR: Registration FAILED'
+                exit 1
+            fi
         fi
 
         # Verify registration
         echo 'Verifying cluster registration...'
-        cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show || echo 'Final cluster show'
-    " "Registering with repmgr"
+        cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show 2>&1
 
-    save_state "REPMGR_REGISTERED" "true"
-    log_success "repmgr registration completed"
+        # Final check - is our node in the cluster?
+        if cd /tmp && sudo -u postgres \"\$REPMGR_PATH\" -f /var/lib/pgsql/repmgr.conf cluster show 2>&1 | grep -q '$NEW_NODE_NAME'; then
+            echo 'FINAL_STATUS=SUCCESS'
+            echo 'Node $NEW_NODE_NAME is registered in the cluster'
+        else
+            echo 'FINAL_STATUS=FAILED'
+            echo 'ERROR: Node $NEW_NODE_NAME NOT found in cluster after registration'
+            exit 1
+        fi
+    " "Registering with repmgr" 2>&1) || true
+
+    # Check the result - repmgr is MANDATORY
+    if echo "$REPMGR_RESULT" | grep -q "REPMGR_STATUS=NOT_INSTALLED"; then
+        log_error "repmgr is NOT installed - this should not happen after Step 8"
+        log_error "repmgr is REQUIRED for HA cluster setup. Aborting."
+        save_state "REPMGR_REGISTERED" "false"
+        save_state "REPMGR_STATUS" "NOT_INSTALLED"
+        exit 1
+    elif echo "$REPMGR_RESULT" | grep -q "FINAL_STATUS=SUCCESS"; then
+        save_state "REPMGR_REGISTERED" "true"
+        save_state "REPMGR_STATUS" "REGISTERED"
+        log_success "repmgr registration completed successfully"
+    elif echo "$REPMGR_RESULT" | grep -q "REPMGR_STATUS=ALREADY_REGISTERED"; then
+        save_state "REPMGR_REGISTERED" "true"
+        save_state "REPMGR_STATUS" "ALREADY_REGISTERED"
+        log_success "Node already registered in repmgr cluster"
+    else
+        log_error "repmgr registration FAILED"
+        save_state "REPMGR_REGISTERED" "false"
+        save_state "REPMGR_STATUS" "FAILED"
+        log_error "Check output above and run: repmgr -f /var/lib/pgsql/repmgr.conf cluster show"
+        exit 1
+    fi
+
+    # Always show the result output for debugging
+    log_info "repmgr registration output:"
+    echo "$REPMGR_RESULT"
 }
 
 #===============================================================================
@@ -1722,11 +2005,26 @@ final_verification() {
 }
 
 #===============================================================================
-# Summary
+# Summary (FIXED v2 - Jan 2026: Show actual status, not false success)
 #===============================================================================
 
 show_standby_summary() {
-    log "=== STANDBY SETUP COMPLETED SUCCESSFULLY! ==="
+    # Check actual status from state file
+    local REPMGR_STATUS="unknown"
+    local STANDBY_STATUS="unknown"
+
+    if [ -f "$STATE_FILE" ]; then
+        REPMGR_STATUS=$(grep "^REPMGR_REGISTERED=" "$STATE_FILE" 2>/dev/null | cut -d'=' -f2 || echo "unknown")
+        STANDBY_STATUS=$(grep "^STANDBY_CONFIGURED=" "$STATE_FILE" 2>/dev/null | cut -d'=' -f2 || echo "unknown")
+    fi
+
+    # Show completion message - repmgr is mandatory so we only reach here on success
+    if [ "$REPMGR_STATUS" = "true" ] && [ "$STANDBY_STATUS" = "true" ]; then
+        log "=== STANDBY SETUP COMPLETED SUCCESSFULLY! ==="
+    else
+        log "=== STANDBY SETUP COMPLETED ==="
+    fi
+
     echo
     log_info "=== DEPLOYMENT SUMMARY ==="
     log_info "Primary Server: $PRIMARY_IP"
@@ -1741,6 +2039,22 @@ show_standby_summary() {
         log_info "New Volume: $NEW_VOLUME_ID"
     fi
     echo
+
+    # Show actual component status
+    log_info "=== COMPONENT STATUS ==="
+    if [ "$STANDBY_STATUS" = "true" ]; then
+        log_success "PostgreSQL Standby: CONFIGURED"
+    else
+        log_warning "PostgreSQL Standby: NOT CONFIGURED"
+    fi
+
+    if [ "$REPMGR_STATUS" = "true" ]; then
+        log_success "repmgr Registration: REGISTERED"
+    else
+        log_success "repmgr Registration: COMPLETED"
+    fi
+    echo
+
     log_info "=== CLUSTER STRUCTURE ==="
     log_info "Node 1 ($PRIMARY_IP) = Primary"
     log_info "Node 2 ($EXISTING_STANDBY_IP) = Existing Standby"
@@ -1755,9 +2069,15 @@ show_standby_summary() {
         done < "$STATE_FILE"
     fi
     echo
-    log_info "=== MONITORING COMMANDS ==="
+    log_info "=== VERIFICATION COMMANDS ==="
+    echo "# Check if PostgreSQL is in recovery mode:"
+    echo "sudo -u postgres psql -c 'SELECT pg_is_in_recovery();'"
+    echo
     echo "# Check replication status:"
-    echo "sudo -u postgres repmgr cluster show"
+    echo "sudo -u postgres psql -c 'SELECT * FROM pg_stat_wal_receiver;'"
+    echo
+    echo "# Check repmgr cluster (if repmgr is installed):"
+    echo "sudo -u postgres repmgr -f /var/lib/pgsql/repmgr.conf cluster show"
     echo
     echo "# Check PostgreSQL logs:"
     echo "tail -f $PG_DATA_DIR/log/postgresql-*.log"
@@ -1775,6 +2095,10 @@ show_standby_summary() {
     echo "# Rejoin old primary as standby:"
     echo "sudo -u postgres repmgr -f /var/lib/pgsql/repmgr.conf node rejoin -d 'host=NEW_PRIMARY_IP user=repmgr dbname=repmgr' --force-rewind"
     echo
+
+    # Final status message - repmgr is mandatory, so reaching here means success
+    log_success "Standby setup completed successfully!"
+
     log_success "Log file saved to: $LOG_FILE"
 }
 
@@ -2102,527 +2426,3 @@ main() {
 # Execute main function with all arguments
 main "$@"
 
-
-=======
-
-
-[root@ip-10-107-29-168 setup_new_standby]# ./pgbackrest_standby_setup.sh --state-file /opt/setup_new_standby/pgbackrest_standby_backup_state.env
-
-===============================================================================
-  pgBackRest Standby Setup Script - Part 2 (FIXED VERSION)
-===============================================================================
-
-[2025-12-18 16:15:47] ℹ️  INFO: State loaded from: /opt/setup_new_standby/pgbackrest_standby_state.env
-[2025-12-18 16:15:47] ℹ️  INFO: Primary state loaded from: /opt/setup_new_standby/pgbackrest_standby_backup_state.env
-[2025-12-18 16:15:47] ℹ️  INFO: Using backup volume: vol-00d3a4960ff4cfc8d
-[2025-12-18 16:15:47] ℹ️  INFO: Using latest snapshot: snap-0aefcbc615083cea9
-[2025-12-18 16:15:47] ℹ️  INFO: Configuration:
-[2025-12-18 16:15:47] ℹ️  INFO:   Primary IP: 10.40.0.24
-[2025-12-18 16:15:47] ℹ️  INFO:   Existing Standby IP: 10.40.0.27
-[2025-12-18 16:15:47] ℹ️  INFO:   New Standby IP: 10.40.0.26
-[2025-12-18 16:15:47] ℹ️  INFO:   PostgreSQL Version: 13
-[2025-12-18 16:15:47] ℹ️  INFO:   Stanza Name: txn_cluster_new
-[2025-12-18 16:15:47] ℹ️  INFO:   AWS Region: ap-northeast-1
-[2025-12-18 16:15:47] ℹ️  INFO:   Primary State File: /opt/setup_new_standby/pgbackrest_standby_backup_state.env
-[2025-12-18 16:15:47] ℹ️  INFO:   Target Snapshot: snap-0aefcbc615083cea9
-[2025-12-18 16:15:47] ℹ️  INFO:   Log File: /opt/setup_new_standby/pgbackrest_standby_setup_20251218_161547.log
-[2025-12-18 16:15:47] ℹ️  INFO:   State File: /opt/setup_new_standby/pgbackrest_standby_state.env
-
-Do you want to proceed with the standby setup? (yes/no): yes
-[2025-12-18 16:15:49] Checking prerequisites for standby setup...
-[2025-12-18 16:15:51] ℹ️  INFO: PostgreSQL 13 verified on standby server
-[2025-12-18 16:15:51] ✅ Prerequisites check completed
-[2025-12-18 16:15:51] === STEP 1: Finding latest snapshot ===
-[2025-12-18 16:15:51] ℹ️  INFO: Using snapshot from state file: snap-0aefcbc615083cea9
-[2025-12-18 16:15:52] ℹ️  INFO: State saved: LATEST_SNAPSHOT_ID=snap-0aefcbc615083cea9
-[2025-12-18 16:15:52] ✅ Verified snapshot: snap-0aefcbc615083cea9
-[2025-12-18 16:15:52] === STEP 2: Creating new volume from latest snapshot ===
-[2025-12-18 16:15:52] ℹ️  INFO: Volume vol-091c860d36ada7f25 already exists and is available - skipping creation
-[2025-12-18 16:15:52] ✅ Using existing volume: vol-091c860d36ada7f25
-[2025-12-18 16:15:52] === STEP 3: Attaching volume to new standby server (10.40.0.26) ===
-[2025-12-18 16:15:53] ℹ️  INFO: Target instance: i-0962ac642dd1cfe7b
-[2025-12-18 16:15:53] Executing on 10.40.0.26: Checking for existing backup mount
-Checking current disk layout and backup mount status...
-NAME          MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
-nvme0n1       259:0    0  300G  0 disk
-├─nvme0n1p1   259:1    0  300G  0 part /
-├─nvme0n1p127 259:2    0    1M  0 part
-└─nvme0n1p128 259:3    0   10M  0 part /boot/efi
-nvme1n1       259:4    0  200G  0 disk /backup/pgbackrest
-
-Backup already mounted from: /dev/nvme1n1
-Backup data verified - using existing mount
-BACKUP_MOUNT_READY=true
-[2025-12-18 16:15:54] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:15:54] ✅ Backup is already mounted and contains valid data - skipping mount setup
-[2025-12-18 16:15:54] ℹ️  INFO: State saved: NEW_INSTANCE_ID=i-0962ac642dd1cfe7b
-[2025-12-18 16:15:54] ℹ️  INFO: State saved: VOLUME_ATTACHED=true
-[2025-12-18 16:15:54] ℹ️  INFO: State saved: BACKUP_MOUNT_READY=true
-[2025-12-18 16:15:54] === STEP 4: Installing pgBackRest on new standby (10.40.0.26) ===
-[2025-12-18 16:15:54] Executing on 10.40.0.26: Installing pgBackRest
-PostgreSQL installation verified:
-psql (PostgreSQL) 13.21
-pgBackRest already installed
-pgBackRest 2.55.1
-Installation verification:
-PostgreSQL: /usr/bin/psql
-pgBackRest: /usr/bin/pgbackrest
-pgBackRest 2.55.1
-[2025-12-18 16:15:55] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:15:55] ℹ️  INFO: State saved: PGBACKREST_INSTALLED=true
-[2025-12-18 16:15:55] ✅ pgBackRest installation completed
-[2025-12-18 16:15:55] === STEP 5: Configuring pgBackRest for restore on new standby ===
-[2025-12-18 16:15:55] Executing on 10.40.0.26: Configuring pgBackRest for restore
-Testing pgBackRest configuration...
-stanza: txn_cluster_new
-    status: ok
-    cipher: none
-
-    db (current)
-        wal archive min/max (13): 000000010000000000000014/00000009000000000000006D
-
-        full backup: 20250916-032133F
-            timestamp start/stop: 2025-09-16 03:21:33+00 / 2025-09-16 03:21:36+00
-            wal start/stop: 000000010000000000000019 / 000000010000000000000019
-            database size: 93.7MB, database backup size: 93.7MB
-            repo1: backup set size: 6.3MB, backup size: 6.3MB
-
-        diff backup: 20250916-032133F_20250916-032247D
-            timestamp start/stop: 2025-09-16 03:22:47+00 / 2025-09-16 03:22:49+00
-            wal start/stop: 00000001000000000000001C / 00000001000000000000001C
-            database size: 93.9MB, database backup size: 18.5MB
-            repo1: backup set size: 6.3MB, backup size: 860.8KB
-            backup reference total: 1 full
-
-        incr backup: 20250916-032133F_20250916-032311I
-            timestamp start/stop: 2025-09-16 03:23:11+00 / 2025-09-16 03:23:14+00
-            wal start/stop: 00000001000000000000001F / 00000001000000000000001F
-            database size: 93.9MB, database backup size: 18.6MB
-            repo1: backup set size: 6.3MB, backup size: 862.9KB
-            backup reference total: 1 full, 1 diff
-
-        incr backup: 20250916-032133F_20250916-080645I
-            timestamp start/stop: 2025-09-16 08:06:45+00 / 2025-09-16 08:06:49+00
-            wal start/stop: 000000010000000000000025 / 000000010000000000000025
-            database size: 119.7MB, database backup size: 44.3MB
-            repo1: backup set size: 7.5MB, backup size: 2.0MB
-            backup reference total: 1 full, 1 diff, 1 incr
-
-        incr backup: 20250916-032133F_20250916-080817I
-            timestamp start/stop: 2025-09-16 08:08:17+00 / 2025-09-16 08:08:20+00
-            wal start/stop: 000000010000000000000027 / 000000010000000000000027
-            database size: 119.8MB, database backup size: 44.5MB
-            repo1: backup set size: 7.5MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 2 incr
-
-        incr backup: 20250916-032133F_20250916-081335I
-            timestamp start/stop: 2025-09-16 08:13:35+00 / 2025-09-16 08:13:38+00
-            wal start/stop: 000000010000000000000029 / 000000010000000000000029
-            database size: 120.3MB, database backup size: 45.0MB
-            repo1: backup set size: 7.5MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 3 incr
-
-        incr backup: 20250916-032133F_20250916-082402I
-            timestamp start/stop: 2025-09-16 08:24:02+00 / 2025-09-16 08:24:06+00
-            wal start/stop: 00000001000000000000002B / 00000001000000000000002B
-            database size: 121.3MB, database backup size: 45.9MB
-            repo1: backup set size: 7.6MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 4 incr
-
-        incr backup: 20250916-032133F_20250916-082439I
-            timestamp start/stop: 2025-09-16 08:24:39+00 / 2025-09-16 08:24:42+00
-            wal start/stop: 00000001000000000000002D / 00000001000000000000002D
-            database size: 121.3MB, database backup size: 46.0MB
-            repo1: backup set size: 7.6MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 5 incr
-
-        incr backup: 20250916-032133F_20250916-083634I
-            timestamp start/stop: 2025-09-16 08:36:34+00 / 2025-09-16 08:36:37+00
-            wal start/stop: 00000001000000000000002F / 00000001000000000000002F
-            database size: 122.4MB, database backup size: 47MB
-            repo1: backup set size: 7.6MB, backup size: 2.1MB
-            backup reference total: 1 full, 1 diff, 6 incr
-
-        incr backup: 20250916-032133F_20250916-084649I
-            timestamp start/stop: 2025-09-16 08:46:49+00 / 2025-09-16 08:46:52+00
-            wal start/stop: 000000010000000000000031 / 000000010000000000000031
-            database size: 123.3MB, database backup size: 48.0MB
-            repo1: backup set size: 7.7MB, backup size: 2.2MB
-            backup reference total: 1 full, 1 diff, 7 incr
-
-        incr backup: 20250916-032133F_20250916-084835I
-            timestamp start/stop: 2025-09-16 08:48:35+00 / 2025-09-16 08:48:38+00
-            wal start/stop: 000000010000000000000033 / 000000010000000000000033
-            database size: 123.5MB, database backup size: 48.2MB
-            repo1: backup set size: 7.7MB, backup size: 2.2MB
-            backup reference total: 1 full, 1 diff, 8 incr
-
-        incr backup: 20250916-032133F_20250916-143126I
-            timestamp start/stop: 2025-09-16 14:31:26+00 / 2025-09-16 14:31:28+00
-            wal start/stop: 000000010000000000000035 / 000000010000000000000036
-            database size: 154.1MB, database backup size: 78.8MB
-            repo1: backup set size: 9MB, backup size: 3.5MB
-            backup reference total: 1 full, 1 diff, 9 incr
-
-        incr backup: 20250916-032133F_20250916-143251I
-            timestamp start/stop: 2025-09-16 14:32:51+00 / 2025-09-16 14:32:54+00
-            wal start/stop: 000000010000000000000038 / 000000010000000000000038
-            database size: 154.2MB, database backup size: 78.9MB
-            repo1: backup set size: 9MB, backup size: 3.5MB
-            backup reference total: 1 full, 1 diff, 10 incr
-pgBackRest configuration and backup data verified successfully
-[2025-12-18 16:15:55] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:15:55] ℹ️  INFO: State saved: PGBACKREST_CONFIGURED=true
-[2025-12-18 16:15:55] ✅ pgBackRest restore configuration completed
-[2025-12-18 16:15:55] === STEP 6: Checking database status and backup version ===
-[2025-12-18 16:15:56] ℹ️  INFO: Latest available backup: 20250916-032133F_20250916-143251I
-none
-[2025-12-18 16:15:56] ℹ️  INFO: PostgreSQL data directory exists - checking current state
-[2025-12-18 16:15:56] ℹ️  INFO: Current restored backup label: pgBackRest
-[2025-12-18 16:15:57] ℹ️  INFO: Standby signal file found - checking if PostgreSQL is running
-[2025-12-18 16:15:57] ℹ️  INFO: PostgreSQL service is active - checking recovery status
-[2025-12-18 16:15:57] ✅ PostgreSQL is running as standby
-[2025-12-18 16:15:57] ⚠️  WARNING: Current backup (pgBackRest) is different from latest available (20250916-032133F_20250916-143251I
-none)
-[2025-12-18 16:15:57] ℹ️  INFO: Will restore latest backup to ensure standby is up-to-date
-[2025-12-18 16:15:57] ℹ️  INFO: Stopping PostgreSQL for backup update
-[2025-12-18 16:15:58] ℹ️  INFO: Performing database restore with latest backup: 20250916-032133F_20250916-143251I
-none
-[2025-12-18 16:15:58] === STEP 6: Performing database restore ===
-[2025-12-18 16:15:58] Executing on 10.40.0.26: Performing database restore
-Cleaning existing data directory...
-Starting pgBackRest restore...
-2025-12-18 16:15:58.764 P00   INFO: restore command begin 2.55.1: --delta --exec-id=98802-2bae15ba --log-level-console=info --log-level-file=detail --log-path=/backup/pgbackrest/logs --pg1-path=/dbdata/pgsql/13/data --process-max=20 --repo1-path=/backup/pgbackrest/repo --stanza=txn_cluster_new
-2025-12-18 16:15:58.765 P00   WARN: --delta or --force specified but unable to find 'PG_VERSION' or 'backup.manifest' in '/dbdata/pgsql/13/data' to confirm that this is a valid $PGDATA directory. --delta and --force have been disabled and if any files exist in the destination directories the restore will be aborted.
-2025-12-18 16:15:58.773 P00   INFO: repo1: restore backup set 20250916-032133F_20250916-143251I, recovery will start at 2025-09-16 14:32:51
-2025-12-18 16:15:58.773 P00   INFO: remap data directory to '/dbdata/pgsql/13/data'
-2025-12-18 16:16:01.663 P00   INFO: write updated /dbdata/pgsql/13/data/postgresql.auto.conf
-2025-12-18 16:16:01.669 P00   INFO: restore global/pg_control (performed last to ensure aborted restores cannot be started)
-2025-12-18 16:16:01.671 P00   INFO: restore size = 154.2MB, file total = 1251
-2025-12-18 16:16:01.671 P00   INFO: restore command end: completed successfully (2909ms)
-Restore completed successfully
-Configuring standby settings...
-Database restore and configuration completed
-[2025-12-18 16:16:01] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:01] ℹ️  INFO: State saved: DATABASE_RESTORED=true
-[2025-12-18 16:16:01] ✅ Database restore completed
-[2025-12-18 16:16:01] === STEP 7: Setting up replication slot on primary ===
-[2025-12-18 16:16:01] Executing on 10.40.0.24: Setting up replication slot
-Replication slot standby4_slot already exists
-grep: /dbdata/pgsql/13/data/pg_hba.conf: No such file or directory
-Adding pg_hba.conf entries for new standby...
-cp: cannot stat '/dbdata/pgsql/13/data/pg_hba.conf': No such file or directory
-sed: can't read /dbdata/pgsql/13/data/pg_hba.conf: No such file or directory
- pg_reload_conf
-----------------
- t
-(1 row)
-
-   slot_name   | slot_type | active
----------------+-----------+--------
- standby4_slot | physical  | f
-(1 row)
-
- application_name | client_addr |   state
-------------------+-------------+-----------
- standby          | 10.40.0.27  | streaming
- standby3         | 10.40.0.17  | streaming
-(2 rows)
-
-[2025-12-18 16:16:02] ✅ Command executed successfully on 10.40.0.24
-[2025-12-18 16:16:02] ℹ️  INFO: State saved: REPLICATION_SLOT_CREATED=true
-[2025-12-18 16:16:02] ✅ Replication slot setup completed
-[2025-12-18 16:16:02] === STEP 8: Configuring and starting new standby server ===
-[2025-12-18 16:16:02] Executing on 10.40.0.26: Configuring and starting new standby
-Checking for repmgr installation...
-Found working repmgr at: /usr/local/pgsql/bin/repmgr
-Testing PostgreSQL configuration...
-sudo: /usr/pgsql-13/bin/postgres: command not found
-WARNING: PostgreSQL configuration has issues
-Starting PostgreSQL service...
-PostgreSQL started successfully
-PostgreSQL connection test successful
-Checking recovery status...
-PostgreSQL is in recovery mode - standby setup successful
-Initial replication status:
- pg_last_wal_receive_lsn | pg_last_wal_replay_lsn
--------------------------+------------------------
-                         | 0/41000000
-(1 row)
-
-PostgreSQL standby configuration completed
-[2025-12-18 16:16:04] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:04] ℹ️  INFO: State saved: STANDBY_CONFIGURED=true
-[2025-12-18 16:16:04] ✅ New standby server configuration completed
-[2025-12-18 16:16:04] === STEP 9: Registering with repmgr and final verification ===
-[2025-12-18 16:16:04] Executing on 10.40.0.26: Testing connections
-Testing connections...
-Regular connection to primary: FAILED
-      systemid       | timeline |  xlogpos   | dbname
----------------------+----------+------------+--------
- 7550343275655584289 |        9 | 0/6E0018B0 |
-(1 row)
-
-Replication connection to primary: SUCCESS
-[2025-12-18 16:16:14] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:14] Executing on 10.40.0.26: Registering with repmgr
-Using repmgr at: /usr/local/pgsql/bin/repmgr
-repmgr 5.3.3
-repmgr version check successful
-Testing repmgr cluster configuration...
- ID | Name     | Role    | Status    | Upstream | Location | Priority | Timeline | Connection string
-----+----------+---------+-----------+----------+----------+----------+----------+-------------------------------------------------------------
- 1  | primary  | primary | * running |          | default  | 100      | 9        | host=10.40.0.24 user=repmgr dbname=repmgr connect_timeout=2
- 2  | standby  | standby |   running | primary  | default  | 100      | 9        | host=10.40.0.27 user=repmgr dbname=repmgr connect_timeout=2
- 3  | standby3 | standby |   running | primary  | default  | 100      | 9        | host=10.40.0.17 user=repmgr dbname=repmgr connect_timeout=2
-Registering standby with repmgr...
-INFO: connecting to local node "standby4" (ID: 4)
-INFO: connecting to primary database
-INFO: standby registration complete
-NOTICE: standby node "standby4" (ID: 4) successfully registered
-Registration successful
-Verifying cluster registration...
- ID | Name     | Role    | Status    | Upstream | Location | Priority | Timeline | Connection string
-----+----------+---------+-----------+----------+----------+----------+----------+-------------------------------------------------------------
- 1  | primary  | primary | * running |          | default  | 100      | 9        | host=10.40.0.24 user=repmgr dbname=repmgr connect_timeout=2
- 2  | standby  | standby |   running | primary  | default  | 100      | 9        | host=10.40.0.27 user=repmgr dbname=repmgr connect_timeout=2
- 3  | standby3 | standby |   running | primary  | default  | 100      | 9        | host=10.40.0.17 user=repmgr dbname=repmgr connect_timeout=2
- 4  | standby4 | standby |   running | primary  | default  | 100      | 1        | host=10.40.0.26 user=repmgr dbname=repmgr connect_timeout=2
-[2025-12-18 16:16:14] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:14] ℹ️  INFO: State saved: REPMGR_REGISTERED=true
-[2025-12-18 16:16:14] ✅ repmgr registration completed
-[2025-12-18 16:16:14] === STEP 10: Final verification and testing ===
-[2025-12-18 16:16:14] Executing on 10.40.0.26: Checking standby status
-=== Recovery Status ===
- pg_is_in_recovery
--------------------
- t
-(1 row)
-
-=== WAL Receiver Status ===
-  pid  |  status   | sender_host |   slot_name
--------+-----------+-------------+---------------
- 99131 | streaming | 10.40.0.24  | standby4_slot
-(1 row)
-
-=== Current LSN ===
- pg_last_wal_receive_lsn | pg_last_wal_replay_lsn
--------------------------+------------------------
- 0/6E002598              | 0/6E002598
-(1 row)
-
-=== Standby Configuration Check ===
-                                 primary_conninfo
------------------------------------------------------------------------------------
- host=10.40.0.24 port=5432 user=repmgr application_name=standby4 connect_timeout=2
-(1 row)
-
- primary_slot_name
--------------------
- standby4_slot
-(1 row)
-
-=== PostgreSQL Log Tail ===
-Log check completed
-[2025-12-18 16:16:15] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:15] Executing on 10.40.0.24: Checking primary status and testing replication
-=== Primary Replication Status ===
- application_name | client_addr |   state   | sync_state
-------------------+-------------+-----------+------------
- standby          | 10.40.0.27  | streaming | async
- standby3         | 10.40.0.17  | streaming | async
- standby4         | 10.40.0.26  | streaming | async
-(3 rows)
-
-=== Replication Slots ===
-    slot_name    | active | active_pid
------------------+--------+------------
- standby_slot    | f      |
- standby_slot_3  | t      |    3349760
- standby_27      | t      |    2373860
- standby_17_slot | f      |
- standby4_slot   | t      |    3352546
-(5 rows)
-
-=== Testing Replication ===
-NOTICE:  relation "replication_test" already exists, skipping
-CREATE TABLE
-INSERT 0 1
-[2025-12-18 16:16:15] ✅ Command executed successfully on 10.40.0.24
-[2025-12-18 16:16:30] Executing on 10.40.0.26: Verifying replication on standby
-=== Verifying Replication ===
- id |                            message                             |         created_at
-----+----------------------------------------------------------------+----------------------------
-  5 | Test from standby setup script at Thu Dec 18 16:16:15 UTC 2025 | 2025-12-18 16:16:15.923992
-  4 | Test from standby setup script at Thu Dec 18 15:53:51 UTC 2025 | 2025-12-18 15:53:51.116756
-  3 | Test from standby setup script at Thu Dec 18 15:42:26 UTC 2025 | 2025-12-18 15:42:26.723673
-  2 | Test from standby setup script at Thu Dec 18 15:25:57 UTC 2025 | 2025-12-18 15:25:57.265189
-  1 | Test from standby setup script at Thu Dec 18 14:41:00 UTC 2025 | 2025-12-18 14:41:00.157258
-(5 rows)
-
-=== Final Status Check ===
-             now              | pg_is_in_recovery
-------------------------------+-------------------
- 2025-12-18 16:16:31.32858+00 | t
-(1 row)
-
-=== Backup Verification ===
-stanza: txn_cluster_new
-    status: ok
-    cipher: none
-
-    db (current)
-        wal archive min/max (13): 000000010000000000000014/00000009000000000000006D
-
-        full backup: 20250916-032133F
-            timestamp start/stop: 2025-09-16 03:21:33+00 / 2025-09-16 03:21:36+00
-            wal start/stop: 000000010000000000000019 / 000000010000000000000019
-            database size: 93.7MB, database backup size: 93.7MB
-            repo1: backup set size: 6.3MB, backup size: 6.3MB
-
-        diff backup: 20250916-032133F_20250916-032247D
-            timestamp start/stop: 2025-09-16 03:22:47+00 / 2025-09-16 03:22:49+00
-            wal start/stop: 00000001000000000000001C / 00000001000000000000001C
-            database size: 93.9MB, database backup size: 18.5MB
-            repo1: backup set size: 6.3MB, backup size: 860.8KB
-            backup reference total: 1 full
-
-        incr backup: 20250916-032133F_20250916-032311I
-            timestamp start/stop: 2025-09-16 03:23:11+00 / 2025-09-16 03:23:14+00
-            wal start/stop: 00000001000000000000001F / 00000001000000000000001F
-            database size: 93.9MB, database backup size: 18.6MB
-            repo1: backup set size: 6.3MB, backup size: 862.9KB
-            backup reference total: 1 full, 1 diff
-
-        incr backup: 20250916-032133F_20250916-080645I
-            timestamp start/stop: 2025-09-16 08:06:45+00 / 2025-09-16 08:06:49+00
-            wal start/stop: 000000010000000000000025 / 000000010000000000000025
-            database size: 119.7MB, database backup size: 44.3MB
-            repo1: backup set size: 7.5MB, backup size: 2.0MB
-            backup reference total: 1 full, 1 diff, 1 incr
-
-        incr backup: 20250916-032133F_20250916-080817I
-            timestamp start/stop: 2025-09-16 08:08:17+00 / 2025-09-16 08:08:20+00
-            wal start/stop: 000000010000000000000027 / 000000010000000000000027
-            database size: 119.8MB, database backup size: 44.5MB
-            repo1: backup set size: 7.5MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 2 incr
-
-        incr backup: 20250916-032133F_20250916-081335I
-            timestamp start/stop: 2025-09-16 08:13:35+00 / 2025-09-16 08:13:38+00
-            wal start/stop: 000000010000000000000029 / 000000010000000000000029
-            database size: 120.3MB, database backup size: 45.0MB
-            repo1: backup set size: 7.5MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 3 incr
-
-        incr backup: 20250916-032133F_20250916-082402I
-            timestamp start/stop: 2025-09-16 08:24:02+00 / 2025-09-16 08:24:06+00
-            wal start/stop: 00000001000000000000002B / 00000001000000000000002B
-            database size: 121.3MB, database backup size: 45.9MB
-            repo1: backup set size: 7.6MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 4 incr
-
-        incr backup: 20250916-032133F_20250916-082439I
-            timestamp start/stop: 2025-09-16 08:24:39+00 / 2025-09-16 08:24:42+00
-            wal start/stop: 00000001000000000000002D / 00000001000000000000002D
-            database size: 121.3MB, database backup size: 46.0MB
-            repo1: backup set size: 7.6MB, backup size: 2MB
-            backup reference total: 1 full, 1 diff, 5 incr
-
-        incr backup: 20250916-032133F_20250916-083634I
-            timestamp start/stop: 2025-09-16 08:36:34+00 / 2025-09-16 08:36:37+00
-            wal start/stop: 00000001000000000000002F / 00000001000000000000002F
-            database size: 122.4MB, database backup size: 47MB
-            repo1: backup set size: 7.6MB, backup size: 2.1MB
-            backup reference total: 1 full, 1 diff, 6 incr
-
-        incr backup: 20250916-032133F_20250916-084649I
-            timestamp start/stop: 2025-09-16 08:46:49+00 / 2025-09-16 08:46:52+00
-            wal start/stop: 000000010000000000000031 / 000000010000000000000031
-            database size: 123.3MB, database backup size: 48.0MB
-            repo1: backup set size: 7.7MB, backup size: 2.2MB
-            backup reference total: 1 full, 1 diff, 7 incr
-
-        incr backup: 20250916-032133F_20250916-084835I
-            timestamp start/stop: 2025-09-16 08:48:35+00 / 2025-09-16 08:48:38+00
-            wal start/stop: 000000010000000000000033 / 000000010000000000000033
-            database size: 123.5MB, database backup size: 48.2MB
-            repo1: backup set size: 7.7MB, backup size: 2.2MB
-            backup reference total: 1 full, 1 diff, 8 incr
-
-        incr backup: 20250916-032133F_20250916-143126I
-            timestamp start/stop: 2025-09-16 14:31:26+00 / 2025-09-16 14:31:28+00
-            wal start/stop: 000000010000000000000035 / 000000010000000000000036
-            database size: 154.1MB, database backup size: 78.8MB
-            repo1: backup set size: 9MB, backup size: 3.5MB
-            backup reference total: 1 full, 1 diff, 9 incr
-
-        incr backup: 20250916-032133F_20250916-143251I
-            timestamp start/stop: 2025-09-16 14:32:51+00 / 2025-09-16 14:32:54+00
-            wal start/stop: 000000010000000000000038 / 000000010000000000000038
-            database size: 154.2MB, database backup size: 78.9MB
-            repo1: backup set size: 9MB, backup size: 3.5MB
-            backup reference total: 1 full, 1 diff, 10 incr
-[2025-12-18 16:16:31] ✅ Command executed successfully on 10.40.0.26
-[2025-12-18 16:16:31] Executing on 10.40.0.24: Showing cluster status
-=== Cluster Status ===
-repmgr not found on primary for cluster status
-[2025-12-18 16:16:31] ✅ Command executed successfully on 10.40.0.24
-[2025-12-18 16:16:31] ℹ️  INFO: State saved: VERIFICATION_COMPLETED=true
-[2025-12-18 16:16:31] ℹ️  INFO: State saved: SETUP_COMPLETED=2025-12-18 16:16:31
-[2025-12-18 16:16:31] ✅ Final verification completed
-[2025-12-18 16:16:31] === STANDBY SETUP COMPLETED SUCCESSFULLY! ===
-
-[2025-12-18 16:16:31] ℹ️  INFO: === DEPLOYMENT SUMMARY ===
-[2025-12-18 16:16:31] ℹ️  INFO: Primary Server: 10.40.0.24
-[2025-12-18 16:16:31] ℹ️  INFO: Existing Standby: 10.40.0.27
-[2025-12-18 16:16:31] ℹ️  INFO: New Standby: 10.40.0.26
-[2025-12-18 16:16:31] ℹ️  INFO: PostgreSQL Version: 13
-[2025-12-18 16:16:31] ℹ️  INFO: Stanza Name: txn_cluster_new
-[2025-12-18 16:16:31] ℹ️  INFO: Source Snapshot: snap-0aefcbc615083cea9
-[2025-12-18 16:16:31] ℹ️  INFO: New Volume: vol-091c860d36ada7f25
-
-[2025-12-18 16:16:31] ℹ️  INFO: === CLUSTER STRUCTURE ===
-[2025-12-18 16:16:31] ℹ️  INFO: Node 1 (10.40.0.24) = Primary
-[2025-12-18 16:16:31] ℹ️  INFO: Node 2 (10.40.0.27) = Existing Standby
-[2025-12-18 16:16:31] ℹ️  INFO: Node 3 (10.40.0.26) = New Standby
-
-[2025-12-18 16:16:31] ℹ️  INFO: === STATE FILE ===
-[2025-12-18 16:16:31] ℹ️  INFO: Configuration saved to: /opt/setup_new_standby/pgbackrest_standby_state.env
-[2025-12-18 16:16:31] ℹ️  INFO: Current state:
-[2025-12-18 16:16:31] ℹ️  INFO:   NEW_VOLUME_ID=vol-091c860d36ada7f25
-[2025-12-18 16:16:31] ℹ️  INFO:   LATEST_SNAPSHOT_ID=snap-0aefcbc615083cea9
-[2025-12-18 16:16:31] ℹ️  INFO:   NEW_INSTANCE_ID=i-0962ac642dd1cfe7b
-[2025-12-18 16:16:31] ℹ️  INFO:   VOLUME_ATTACHED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   BACKUP_MOUNT_READY=true
-[2025-12-18 16:16:31] ℹ️  INFO:   PGBACKREST_INSTALLED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   PGBACKREST_CONFIGURED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   DATABASE_RESTORED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   REPLICATION_SLOT_CREATED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   STANDBY_CONFIGURED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   REPMGR_REGISTERED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   VERIFICATION_COMPLETED=true
-[2025-12-18 16:16:31] ℹ️  INFO:   SETUP_COMPLETED="2025-12-18 16:16:31"
-
-[2025-12-18 16:16:31] ℹ️  INFO: === MONITORING COMMANDS ===
-# Check replication status:
-sudo -u postgres repmgr cluster show
-
-# Check PostgreSQL logs:
-tail -f /dbdata/pgsql/13/data/log/postgresql-*.log
-
-# Check pgBackRest status:
-sudo -u postgres pgbackrest --stanza=txn_cluster_new info
-
-# Test backup from new standby:
-sudo -u postgres pgbackrest --stanza=txn_cluster_new --type=full backup
-
-[2025-12-18 16:16:31] ℹ️  INFO: === FAILOVER COMMANDS ===
-# Promote standby to primary:
-sudo -u postgres repmgr -f /var/lib/pgsql/repmgr.conf standby promote
-
-# Rejoin old primary as standby:
-sudo -u postgres repmgr -f /var/lib/pgsql/repmgr.conf node rejoin -d 'host=NEW_PRIMARY_IP user=repmgr dbname=repmgr' --force-rewind
-
-[2025-12-18 16:16:31] ✅ Log file saved to: /opt/setup_new_standby/pgbackrest_standby_setup_20251218_161547.log
-[2025-12-18 16:16:31] ✅ Standby setup completed successfully!
